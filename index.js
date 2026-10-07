@@ -295,6 +295,10 @@ export function apply(ctx, rawConfig) {
     cfg.autoStart = next.autoStart
     cfg.allowFetchFromPeer = next.allowFetchFromPeer
     cfg.requireAgentStatus = next.requireAgentStatus
+    // ⚠️ wakeSessions 也必须一起刷新：早期实现逐个字段赋值、漏了它，
+    //    于是"插件加载之后再勾选会话"永远读不到 —— 表现就是勾了却仍报"没有唤醒目标"。
+    //    改成整体合并，从根本上杜绝"新增字段忘了刷新"这一类错误。
+    Object.assign(cfg, next)
     if (!next.enabled) {
       for (const b of buffers.values()) clearTimeout(b.wakeTimer)
       buffers.clear()
