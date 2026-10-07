@@ -4,7 +4,7 @@
 > **不需要浏览器、不需要解析 HTML**。端口就是本机默认 web 端口（默认 80，即 `http://127.0.0.1/`）。
 
 - 入口自检：`GET /dsh` → 返回所有接口清单
-- 本文档对应版本：**v1.5.2+**
+- 本文档对应版本：**v1.5.4+**
 - 机器可读版：`GET /dsh/help`
 
 ---
@@ -184,7 +184,7 @@ curl -s -X POST http://127.0.0.1/dsh/sendfile \
 **`GET /dsh/whoami`**
 ```json
 {"ok":true,"name":"AI甲","nodeId":"192.168.1.10:80","port":80,
- "ips":"192.168.1.10,...","version":"1.5.2","letter":"甲","color":"3fa9f5","dataDir":"..."}
+ "ips":"192.168.1.10,...","version":"1.5.4","letter":"甲","color":"3fa9f5","dataDir":"..."}
 ```
 
 **`GET /dsh/peers`**
