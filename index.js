@@ -107,7 +107,11 @@ function specToJsonSchema(parameters) {
   }
   const schema = { type: 'object', properties }
   if (required.length > 0) schema.required = required
-  schema.additionalProperties = false
+  // ⚠️ 刻意**不设** additionalProperties:false —— 与 DSH 官方 parameterSchemaSpecToJsonSchema
+  //    保持一致（它也不设）。设成 false 的后果：模型只要多带一个字段（很常见，比如顺手加
+  //    to / message / content），参数校验就会在他进入我们代码**之前**失败并报
+  //    `invalid arguments: arguments.xxx is not a supported property` —— 看起来就像
+  //    "这个工具有缺陷"。宽松比严格稳，多余字段各工具自己忽略即可。
   return schema
 }
 
@@ -592,7 +596,7 @@ export function apply(ctx, rawConfig) {
       '查看 LanChat 局域网通讯状态：本机名称/节点号、当前在线的其它机器、最近收到的文件。' +
       '要与别的机器通讯前先调用它确认对方在线。',
     parameters: {
-      includeFiles: { type: 'boolean', description: '是否同时列出最近的文件（默认 false）' },
+      includeFiles: { type: 'boolean', description: '同时列出最近的文件' },
     },
     output: jsonOutput(OBJ({
       ok: { type: 'boolean' },
@@ -638,14 +642,14 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(defineTool({
     name: 'lanchat_recv',
     description:
-      '读取局域网消息。peer 省略 = 群聊，给了 = 与那台机器的私聊（只有你们两人看得到）。' +
-      '返回值里 next 是游标：下次调用把它当 since。自己发的消息 mine=true，不要回复自己。' +
-      'waitSeconds>0 时若无新消息会挂起等待（长轮询，推荐 15-25），适合等对方回复。' +
-      '收到"LanChat 收到消息"的唤醒提示后调用本工具即可拿到完整正文与文件磁盘路径。',
+      '读取局域网消息：peer 省略 = 群聊，给了 = 与那台机器的私聊。' +
+      '收到唤醒提示后调用本工具即可拿到完整正文与文件磁盘路径。',
     parameters: {
       peer: { type: 'string', description: '对方机器名或节点号（如 DESKTOP-ABC 或 192.168.0.5:80）；省略 = 群聊' },
       since: { type: 'number', description: '游标：上次返回的 next；首次传 0' },
       waitSeconds: { type: 'number', description: '长轮询等待秒数（0-25），默认 0 立即返回' },
+      wait: { type: 'number', description: 'waitSeconds 别名' },
+      timeout: { type: 'number', description: 'waitSeconds 别名' },
     },
     output: jsonOutput(OBJ({
       ok: { type: 'boolean' },
@@ -657,7 +661,7 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       refresh()
       remember(exec)
-      const wait = Math.max(0, Math.min(25, Number(args.waitSeconds ?? 0) || 0))
+      const wait = Math.max(0, Math.min(25, Number(args.waitSeconds ?? args.wait ?? args.timeout ?? 0) || 0))
       const q = [`since=${Number(args.since ?? 0) || 0}`, `timeout=${wait}`]
       if (args.peer && args.peer !== 'all' && args.peer !== 'public') q.push(`peer=${encodeURIComponent(args.peer)}`)
       const r = await http(`/dsh/recv?${q.join('&')}`, { timeoutMs: wait * 1000 + 15000 })
@@ -677,15 +681,15 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(defineTool({
     name: 'lanchat_send',
     description:
-      '向局域网其它机器发消息或文件。**默认合并发送**：同一目标连续发送的内容会攒成一批' +
-      `（空闲 ${Math.round(cfg.batchWindowMs / 1000)} 秒后自动发出，或调用 lanchat_flush 立即发出），` +
-      '对面收到的是一条消息 + 一个批次号，能一次看全 —— 避免"文字先到把对面 AI 唤醒、文件后到被忽略"。' +
-      '**要发文字 + 文件、或连续说几句时：连续调用本工具，最后调用一次 lanchat_flush。**' +
-      'mode=now 表示不合并、立刻单独发出（只适合一句话且不带文件的场景）。',
+      '向局域网其它机器发消息或文件。默认攒批：连续调用会合并成一批一起送出' +
+      `（空闲 ${Math.round(cfg.batchWindowMs / 1000)} 秒自动发出，或用 mode:flush ／ lanchat_flush 立即发出）。` +
+      '要发文字 + 文件、或连续说几句时，最后调用一次 lanchat_flush。',
     parameters: {
       text: { type: 'string', description: '要发送的文字（可与 file 同时给）' },
+      message: { type: 'string', description: 'text 的别名' },
       file: { type: 'string', description: '要发送的本地文件绝对路径' },
       peer: { type: 'string', description: '对方机器名或节点号；省略 = 群聊' },
+      to: { type: 'string', description: 'peer 的别名' },
       mode: { type: 'string', enum: ['stage', 'flush', 'now'], description: 'stage=攒批(默认)、flush=攒批并立即发出、now=立刻单独发出' },
       kind: { type: 'string', description: '内容类型提示：image 表示图片（图片不参与合并，避免对方干等）' },
     },
@@ -700,8 +704,12 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       refresh()
       remember(exec)
-      if (!args.text && !args.file) return { ok: false, error: '至少要给 text 或 file 之一' }
-      const payload = { text: args.text, file: args.file, peer: args.peer, kind: args.kind }
+      // 参数别名：模型常用 message / to 这两种更自然的写法，一并接受 ——
+      // 避免"参数其实对、却报参数错误"（那会被误认为工具缺陷）。
+      const textArg = args.text ?? args.message
+      const peerArg = args.peer ?? args.to
+      if (!textArg && !args.file) return { ok: false, error: '至少要给 text（或 message）与 file 之一' }
+      const payload = { text: textArg, file: args.file, peer: peerArg, kind: args.kind }
       if (args.mode === 'now') {
         const r = await http('/dsh/stage', {
           method: 'POST',
@@ -800,7 +808,7 @@ export function apply(ctx, rawConfig) {
 // 版本兼容探测：agent/status 是 0.2.0 起才有的，晚一点看它有没有来过
   setTimeout(() => {
     if (!stopped && !statusEventsSeen) {
-      log('本机 DSH 未提供 agent/status 事件（0.1.7 及更早）→ 唤醒时机的判忙退化为 queue 语义，功能不受影响')
+      log('提示：暂未观测到 agent/status 事件（本会话还没产生过状态变化，或 DSH 为 0.1.7 及更早）→ 判忙暂按「不忙」处理，功能不受影响')
     }
   }, 5000)
   log(`已加载（端口 ${cfg.port}｜合并窗口 ${cfg.batchWindowMs}ms｜唤醒防抖 ${cfg.wakeDebounceMs}ms）`)
