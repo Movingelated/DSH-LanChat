@@ -1,4 +1,4 @@
-﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
 //
 // 解决两个真实痛点：
 //  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
@@ -115,8 +115,9 @@ function defineTool(options) {
     description: options.description,
     parameters: specToJsonSchema(options.parameters),
     output: options.output,
+    // ⚠️ 这里在**模块作用域**，不能调用 apply() 内定义的 refresh()（会 ReferenceError）。
+    //    配置刷新由各工具自己的 execute 开头调用 refresh() 完成。
     async execute(args, exec) {
-      refresh()
       return options.execute(args ?? {}, exec)
     },
   }
@@ -202,6 +203,8 @@ export function apply(ctx, rawConfig) {
 
   let selfNodeId = ''
   let stopped = false
+  /** 上次尝试启动 LanChat 的失败原因（供 lanchat_status 诊断输出） */
+  let lastStartError = ''
   /** 端口被设置页改过 → 需要重连一次 */
   let reconnect = false
   /** 是否收到过 agent/status 事件（0.1.7 及更早没有这个事件） */
@@ -259,14 +262,23 @@ export function apply(ctx, rawConfig) {
   function candidatePaths() {
     const out = []
     if (cfg.exePath) out.push(cfg.exePath)
+    // ① 与插件**同级**（发布包：exe 与插件文件放在一起）
+    if (PLUGIN_DIR) out.push(path.join(PLUGIN_DIR, 'LanChat.exe'))
+    // ② 插件目录的**上一级 / 上两级**（开发布局：插件在 <项目>\dsh-plugin，exe 在 <项目>\）
+    //    这条很关键：以"插件自身位置"为锚点，而不是靠 DSH 的工作目录 —— 后者随用户从哪启动而变。
+    if (PLUGIN_DIR) {
+      out.push(path.join(PLUGIN_DIR, '..', 'LanChat.exe'))
+      out.push(path.join(PLUGIN_DIR, '..', '..', 'LanChat.exe'))
+    }
+    // ③ DSH 的工作目录（从项目根启动 DSH 的常见情况）
     const cwd = process.cwd()
     out.push(`${cwd}\\LanChat.exe`)
     out.push(`${cwd}\\lanchat\\LanChat.exe`)
-    out.push(`${cwd}\\dsh-plugin-lanchat\\LanChat.exe`)     // 从发布包根目录直接解压的情况
-    out.push(`${cwd}\\..\\LanChat.exe`)
+    out.push(`${cwd}\\dsh-plugin-lanchat\\LanChat.exe`)
+    // ④ 常见安装位置
     if (process.env.LOCALAPPDATA) out.push(`${process.env.LOCALAPPDATA}\\LanChat\\LanChat.exe`)
     if (process.env.ProgramFiles) out.push(`${process.env.ProgramFiles}\\LanChat\\LanChat.exe`)
-    if (process.env.ProgramFiles) out.push(`${process.env.ProgramFiles(x86)}\\LanChat\\LanChat.exe`)
+    if (process.env['ProgramFiles(x86)']) out.push(`${process.env['ProgramFiles(x86)']}\\LanChat\\LanChat.exe`)
     if (process.env.USERPROFILE) out.push(`${process.env.USERPROFILE}\\Desktop\\LanChat.exe`)
     if (process.env.USERPROFILE) out.push(`${process.env.USERPROFILE}\\Downloads\\LanChat.exe`)
     return out
@@ -315,6 +327,7 @@ export function apply(ctx, rawConfig) {
     let exe = await findLocalExe()
     if (!exe) exe = await fetchExeFromPeer()
     if (!exe) {
+      lastStartError = '本地与局域网都没找到 LanChat.exe'
       logErr('找不到 LanChat.exe：请在插件配置里填 exePath，或先手动运行一次 LanChat')
       return null
     }
@@ -340,8 +353,10 @@ export function apply(ctx, rawConfig) {
         windowsHide: false,
       })
       child.unref()            // 不把子进程留在父进程的事件循环里
+      lastStartError = ''
       log(`已启动 LanChat（脱离式，托盘保留，DSH 退出后继续运行）: ${exe}`)
     } catch (e) {
+      lastStartError = 'spawn 失败: ' + String(e?.message ?? e)
       logErr(`启动 LanChat 失败: ${e?.message ?? e}`)
       return null
     }
@@ -350,6 +365,7 @@ export function apply(ctx, rawConfig) {
       const got = await whoami()
       if (got) return got
     }
+    lastStartError = '已启动但探测不到响应（端口占用/防火墙？）'
     logErr('LanChat 启动后仍未响应：检查端口占用或防火墙提示')
     return null
   }
@@ -477,7 +493,25 @@ export function apply(ctx, rawConfig) {
       refresh()
       remember(exec)
       const me = await whoami()
-      if (!me) return { ok: false, error: 'LanChat 未运行或端口不通（检查插件配置的 port / exePath）' }
+      if (!me) {
+        // 连不上时给出**可自己排错的诊断**：找过哪些路径、哪个存在、开关是什么、上次启动报了什么错
+        const fs = await import('node:fs')
+        const cands = candidatePaths().map((p) => ({ path: p, exists: (() => { try { return fs.existsSync(p) } catch { return false } })() }))
+        return {
+          ok: false,
+          error: 'LanChat 未运行或端口不通',
+          howToFix: [
+            '① 若下面 candidates 里有 exists:true 的项，说明 exe 找得到但启动失败 —— 看 lastStartError',
+            '② 若全是 false，请在设置 → 局域网通讯 里把「LanChat.exe 路径」填成实际路径',
+            '③ 也可以手动双击 LanChat.exe 先跑起来，插件会直接接入',
+          ],
+          config: { port: cfg.port, exePath: cfg.exePath || '(未设置)', autoStart: cfg.autoStart, enabled: cfg.enabled },
+          pluginDir: PLUGIN_DIR,
+          dshCwd: process.cwd(),
+          candidates: cands,
+          lastStartError: lastStartError || '(无：还没尝试过启动)',
+        }
+      }
       const peers = (await http('/dsh/peers', { timeoutMs: 6000 })).json?.peers ?? []
       const out = {
         ok: true,
