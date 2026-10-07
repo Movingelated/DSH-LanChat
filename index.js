@@ -1073,5 +1073,11 @@ const OBJ = (props, required) => ({ type: 'object', properties: props, required,
       log('提示：暂未观测到 agent/status 事件（本会话还没产生过状态变化，或 DSH 为 0.1.7 及更早）→ 判忙暂按「不忙」处理，功能不受影响')
     }
   }, 5000)
-  log(`已加载（端口 ${cfg.port}｜合并窗口 ${cfg.batchWindowMs}ms｜唤醒防抖 ${cfg.wakeDebounceMs}ms）`)
+  // ⚠️ 版本与功能标记必须打进启动日志：
+  //    **宿主半身只在 DSH 启动时加载一次**，bundle 开关只重载客户端半身 ——
+  //    所以"磁盘已是新代码、内存还是旧代码"是常态（实测为此排查很久）。
+  //    有了这行，"是否需要重启 DSH"就是可判定的，而不是靠猜。
+  log(`已加载 v${PLUGIN_VERSION}（宿主半身）｜端口 ${cfg.port}｜合并窗口 ${cfg.batchWindowMs}ms｜唤醒防抖 ${cfg.wakeDebounceMs}ms`
+    + `｜多会话勾选=${typeof cfg.wakeSessions !== 'undefined' && Array.isArray(cfg.wakeSessions) ? '有' : '无'}`
+    + `｜私聊监听=${typeof pollConversation === 'function' ? '有' : '无'}`)
 }
