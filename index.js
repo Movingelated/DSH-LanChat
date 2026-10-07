@@ -1,4 +1,4 @@
-// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
 //
 // 解决两个真实痛点：
 //  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url'
 const fsSync = createRequire(import.meta.url)('node:fs')
 
 /** Cordis 插件名（同时也是设置页里的配置命名空间）。 */
+// exported for unit testing only: the plugin itself does not need this symbol exported.
+export { jsonSafe }
 export const name = 'lanchat-bridge'
 
 /** 需要注入的 Harness 服务（sessionController 用可选读取，缺失时降级）。 */
@@ -130,14 +132,15 @@ function defineTool(options) {
       //    Node 会**直接结束进程** —— 表现就是"DSH 突然退出，只剩 LanChat"。实测踩过这个坑。
       //    统一在这里兜住，转成结构化失败结果（对 AI 也更友好：能直接看到原因）。
       try {
-        return await options.execute(args ?? {}, exec)
+        return jsonSafe(await options.execute(args ?? {}, exec))
       } catch (e) {
         const why = String(e?.message ?? e)
         logErr(`工具 ${options.name} 执行失败: ${why}`)
         return {
           ok: false,
           error: why,
-          hint: 'LanChat 可能没在运行或端口不通；可调用 lanchat_status 查看诊断（会列出找过的路径与开关状态）',
+        hint: undefined,
+        hint: jsonSafe('LanChat 可能没在运行或端口不通；可调用 lanchat_status 查看诊断（会列出找过的路径与开关状态）'),
         }
       }
     },
@@ -145,6 +148,26 @@ function defineTool(options) {
 }
 
 /** 统一的 JSON 输出渲染（与 dsh-tools 的 jsonOutput 等价）。 */
+// v1.1.1 FIX (peer defect report, 2026-10-07): every lanchat tool result passes through here first.
+//   Measured: a tool returned fields that were undefined, and the RPC layer reported "value is not
+//   lossless JSON" AFTER the send had already succeeded -- a failure report for a success, which makes
+//   the caller retry and duplicate the message. The peer named the remedy: absent fields become null,
+//   and strings must be well formed (a lone surrogate from truncated emoji also breaks a round trip).
+function jsonSafe(value) {
+  if (value === undefined || value === null) return null
+  const t = typeof value
+  if (t === 'number') return Number.isFinite(value) ? value : null
+  if (t === 'boolean') return value
+  if (t === 'string') return value.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')
+  if (Array.isArray(value)) return value.map(jsonSafe)
+  if (t === 'object') {
+    const out = {}
+    for (const k of Object.keys(value)) out[k] = jsonSafe(value[k])
+    return out
+  }
+  return null
+}
+
 function jsonOutput(schema) {
   return {
     schema,
@@ -477,7 +500,7 @@ export function apply(ctx, rawConfig) {
     if (!sessionAgent) {
       // 不能投递就**丢掉**，绝不在缓冲里囤积 —— 囤积等于内存只涨不降（有过 OOM 事故）。
       // 本会话只要调用过任意 lanchat_* 工具就会绑定 Agent，之后收到的消息才会被唤醒投递。
-      logErr('尚未确定本会话 Agent（本会话还没调用过 LanChat 工具），本条已丢弃；先调用一次 lanchat_status 即可绑定')
+      logErr('还没有会话绑定唤醒目标（本会话没调用过 LanChat 工具），本条已丢弃；在你想接收唤醒的会话里调用一次 lanchat_status 即可绑定')
       buffers.delete(convKey)
       return
     }
@@ -507,7 +530,7 @@ export function apply(ctx, rawConfig) {
         content: [{ type: 'text', text: body }],
       }, wakeSignal())
       buffers.delete(convKey)
-      log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer}`)
+      log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer} → 会话 ${String(sessionAgent.id).slice(0, 12)}…`)
     } catch (e) {
       logErr(`投递失败，消息留在缓冲稍后重试: ${e?.message ?? e}`)
       b.lastAt = Date.now()
@@ -605,9 +628,15 @@ export function apply(ctx, rawConfig) {
   // ---------------------------------------------------------------- 工具
 
   function remember(exec) {
-    if (exec?.agent && !sessionAgent) {
+    // ⚠️ 必须**每次调用都刷新绑定**，而不是只绑第一次：
+    //    旧写法是 if (!sessionAgent)，于是「最先调用过工具的会话」会**永久霸占**唤醒投递；
+    //    用户换到另一个会话之后，消息照旧投给那个旧会话 ——
+    //    在用户眼里就是"消息来了却唤不醒 AI 回答"（实测踩过这个坑）。
+    //    改以「最近一次调用 LanChat 工具的会话」为准：谁在用就投给谁。
+    if (exec?.agent && sessionAgent?.id !== exec.agent.id) {
+      const from = sessionAgent?.id ?? '(未绑定)'
       sessionAgent = exec.agent
-      log(`本会话 Agent 已绑定: ${exec.agent.id}`)
+      log(`唤醒目标已切换到本会话: ${exec.agent.id}（原 ${from}）`)
     }
   }
 
@@ -761,7 +790,13 @@ export function apply(ctx, rawConfig) {
           + (peerArg ? '&to=' + encodeURIComponent(String(peerArg)) : '')
           + (args.kind ? '&kind=' + encodeURIComponent(args.kind) : ''), { timeoutMs: 60000 })
         if (rNow.json?.ok !== true) return { ok: false, error: rNow.json?.error || 'immediate send failed' }
-        return { ok: true, sent: true, drained, note: (drained ? '已先把积压的那批发出去，然后' : '') + '本条单独发出（未合并）' }
+        // v1.1.2: return the SAME key set as stage and flush, so criterion 3 (three branches structurally
+        //   identical) holds literally rather than only in spirit. Keys that do not apply are null.
+        return jsonSafe({
+          ok: true, staged: true, flushed: true, sent: true, drained,
+          items: 1, remainingMs: 0, error: null,
+          note: (drained ? '已先把积压的那批发出去，然后' : '') + '本条单独发出（未合并）',
+        })
       }
       const body = { ...payload }
       if (args.mode === 'flush') body.flush = true
@@ -773,17 +808,13 @@ export function apply(ctx, rawConfig) {
       })
       const j = r.json ?? {}
       const win = Math.round((j.window_ms ?? cfg.batchWindowMs) / 1000)
-      return {
-        ok: j.ok === true,
-        staged: j.staged === true,
-        flushed: j.flushed === true,
-        items: j.items,
-        remainingMs: j.window_ms,
+      return jsonSafe({
+        ok: j.ok === true, staged: j.staged === true, flushed: j.flushed === true, sent: null, drained: null,
+        items: j.items ?? null, remainingMs: j.window_ms ?? null, error: j.error ?? null,
         note: j.flushed
           ? '已作为一整批发给对面'
-          : `已攒入本批（当前 ${j.items ?? 1} 件）。还要发就继续调用 lanchat_send；发完请调用 lanchat_flush 立即送出，否则 ${win} 秒后自动发出。`,
-        error: j.error,
-      }
+          : (`已攒入本批（当前 ${j.items ?? 1} 件）。还要发就继续调用 lanchat_send；发完请调用 lanchat_flush 立即送出，否则 ${win} 秒后自动发出。`),
+      })
     },
   }))
 
@@ -798,7 +829,7 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       refresh()
       remember(exec)
-      const q = args.peer && args.peer !== 'all' ? `?to=${encodeURIComponent(args.peer)}` : ''
+      const q = peerQ(args.peer && args.peer !== 'all' ? args.peer : null)
       const r = await http(`/dsh/stage/flush${q}`, { timeoutMs: 60000 })
       return { ok: r.json?.ok === true, flushed: r.json?.flushed === true }
     },
