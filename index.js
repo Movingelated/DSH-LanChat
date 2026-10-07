@@ -195,6 +195,12 @@ function writeLog(line) {
 function stamp() {
   try { return new Date().toISOString().replace('T', ' ').slice(0, 19) } catch { return '' }
 }
+/** 唤醒投递用的 AbortSignal —— prompt(request, signal) 的第二个参数是必填的。 */
+let _wakeCtrl = null
+function wakeSignal() {
+  if (!_wakeCtrl) _wakeCtrl = new AbortController()
+  return _wakeCtrl.signal
+}
 function log(msg) {
   const line = `[lanchat] ${msg}`
   console.log(line)
@@ -490,12 +496,16 @@ export function apply(ctx, rawConfig) {
     ].join('\n---\n')
     const busy = isBusy()
     try {
+      // ⚠️ prompt(request, signal) 的**第二个参数是必填的**：DSH 内部第一行就是
+      //    signal.throwIfAborted()，只传一个参数会得到
+      //    "Cannot read properties of undefined (reading 'throwIfAborted')"
+      //    —— 实测这正是"收到消息却唤不醒 AI"的原因。
       await sc.prompt({
         requestId: `lanchat-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
         sessionId: sessionAgent.id,
         mode: 'queue',
         content: [{ type: 'text', text: body }],
-      })
+      }, wakeSignal())
       buffers.delete(convKey)
       log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer}`)
     } catch (e) {
@@ -543,6 +553,19 @@ export function apply(ctx, rawConfig) {
     if (stopped) return
     log(`已连接 LanChat（本机 ${selfNodeId || '未知'}，版本 ${me.version ?? '?'}）`)
 
+    // 启动时先把游标推到"现在"，**跳过启动前的历史**：
+    // 否则每次 DSH 重启都会拿一整批旧消息去唤醒 AI（实测会把 50 条历史当一批投递）。
+    // 历史随时可以用 lanchat_recv 主动读，不该由唤醒机制代劳。
+    try {
+      const prime = await http('/dsh/recv?since=0&timeout=0', { timeoutMs: 8000 })
+      const pj = prime.json
+      if (pj?.ok && typeof pj.next === 'number') {
+        cursor = pj.next
+        const mine = (pj.messages ?? []).filter((m) => !m.mine).length
+        if (mine > 0) log(`启动前已有 ${mine} 条消息，已跳过（需要时用 lanchat_recv 主动读）`)
+      }
+    } catch { /* 拿不到就从 0 开始，不影响主流程 */ }
+
     while (!stopped) {
       // 设置页可以随时改配置：启用开关、端口变化都在这里即时生效
       if (!refresh().enabled) { await sleep(1500); continue }
@@ -589,6 +612,13 @@ export function apply(ctx, rawConfig) {
   }
 
   const OBJ = (props, required) => ({ type: 'object', properties: props, required, additionalProperties: true })
+
+  // Builds the ?peer=... fragment from a name, a node id, or "ip:port".
+  // Added with the v1.0.8 now-semantics fix: the immediate send path needs the target in the query.
+  function peerQ(peer) {
+    if (!peer) return ''
+    return '?peer=' + encodeURIComponent(String(peer))
+  }
 
   ctx.tools.register(defineTool({
     name: 'lanchat_status',
@@ -690,12 +720,14 @@ export function apply(ctx, rawConfig) {
       file: { type: 'string', description: '要发送的本地文件绝对路径' },
       peer: { type: 'string', description: '对方机器名或节点号；省略 = 群聊' },
       to: { type: 'string', description: 'peer 的别名' },
-      mode: { type: 'string', enum: ['stage', 'flush', 'now'], description: 'stage=攒批(默认)、flush=攒批并立即发出、now=立刻单独发出' },
+      mode: { type: 'string', enum: ['stage', 'flush', 'now'], description: 'stage=攒批(默认)、flush=攒批并立即发出、now=立刻单独发出（会先把已积压的那批发出去，再单发本条，因此不会与旧内容合并）' },
       kind: { type: 'string', description: '内容类型提示：image 表示图片（图片不参与合并，避免对方干等）' },
     },
     output: jsonOutput(OBJ({
       ok: { type: 'boolean' },
       staged: { type: 'boolean' },
+      sent: { type: 'boolean' },
+      drained: { type: 'boolean' },
       flushed: { type: 'boolean' },
       items: { type: 'number' },
       remainingMs: { type: 'number' },
@@ -711,13 +743,25 @@ export function apply(ctx, rawConfig) {
       if (!textArg && !args.file) return { ok: false, error: '至少要给 text（或 message）与 file 之一' }
       const payload = { text: textArg, file: args.file, peer: peerArg, kind: args.kind }
       if (args.mode === 'now') {
-        const r = await http('/dsh/stage', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json; charset=utf-8' },
-          body: JSON.stringify({ ...payload, flush: true, autoBatch: false }),
-          timeoutMs: 60000,
-        })
-        return { ok: r.json?.ok === true, flushed: true, note: '已立刻单独发出（未合并）' }
+        // v1.0.8 FIX (measured 2026-10-07): 'now' used to POST to /dsh/stage with flush:true, but the server
+        //   flushes the ENTIRE pending buffer for that peer, so anything already staged went out glued to
+        //   this message. It also returned the server echo of the sent text, which for long markdown or
+        //   emoji surfaced as 'value is not lossless JSON' although the message HAD been delivered --
+        //   a failure report for a success, which is the worst possible shape.
+        //   Now: drain whatever is already staged as its own batch first, then send THIS message alone.
+        let drained = false
+        try {
+          const st = await http('/dsh/stage/status' + peerQ(peerArg), { timeoutMs: 8000 })
+          if (Number(st.json?.items ?? 0) > 0) {
+            await http('/dsh/stage/flush' + peerQ(peerArg), { timeoutMs: 60000 })
+            drained = true
+          }
+        } catch { /* best effort; never block a send on the status probe */ }
+        const rNow = await http('/dsh/send?text=' + encodeURIComponent(textArg ?? '')
+          + (peerArg ? '&to=' + encodeURIComponent(String(peerArg)) : '')
+          + (args.kind ? '&kind=' + encodeURIComponent(args.kind) : ''), { timeoutMs: 60000 })
+        if (rNow.json?.ok !== true) return { ok: false, error: rNow.json?.error || 'immediate send failed' }
+        return { ok: true, sent: true, drained, note: (drained ? '已先把积压的那批发出去，然后' : '') + '本条单独发出（未合并）' }
       }
       const body = { ...payload }
       if (args.mode === 'flush') body.flush = true

@@ -342,7 +342,7 @@ GET  /dsh/doc                           完整接口文档（Markdown）
 
 | 组件 | 版本 |
 |---|---|
-| LanChat | 1.5.7 |
+| LanChat | 1.6.0 |
 | DSH 插件 | 1.0.x（宿主 `index.js` + 客户端 `client.js`） |
 
 **DSH 版本兼容性**（已按两版类型声明逐条核对）：
