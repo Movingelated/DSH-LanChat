@@ -1,4 +1,4 @@
-﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
 //
 // 解决两个真实痛点：
 //  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
@@ -121,7 +121,21 @@ function defineTool(options) {
     // ⚠️ 这里在**模块作用域**，不能调用 apply() 内定义的 refresh()（会 ReferenceError）。
     //    配置刷新由各工具自己的 execute 开头调用 refresh() 完成。
     async execute(args, exec) {
-      return options.execute(args ?? {}, exec)
+      // ⚠️ 关键加固：任何工具都不许把异常抛出去。
+      //    LanChat 没在跑时 fetch 会抛 ECONNREFUSED；若让它逃逸成未处理的 Promise 拒绝，
+      //    Node 会**直接结束进程** —— 表现就是"DSH 突然退出，只剩 LanChat"。实测踩过这个坑。
+      //    统一在这里兜住，转成结构化失败结果（对 AI 也更友好：能直接看到原因）。
+      try {
+        return await options.execute(args ?? {}, exec)
+      } catch (e) {
+        const why = String(e?.message ?? e)
+        logErr(`工具 ${options.name} 执行失败: ${why}`)
+        return {
+          ok: false,
+          error: why,
+          hint: 'LanChat 可能没在运行或端口不通；可调用 lanchat_status 查看诊断（会列出找过的路径与开关状态）',
+        }
+      }
     },
   }
 }
