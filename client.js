@@ -135,8 +135,23 @@ window.__ModuleLoader__.load({
       const loadSessions = React.useCallback(async () => {
         setSessErr('')
         try {
-          const api = ctx?.sessions
-          if (!api?.search) { setSess([]); setSessErr('本版客户端没有 ctx.sessions.search，无法列出会话'); return }
+          // ⚠️ Cordis 规定：访问 ctx.sessions 必须先在本插件 inject 里声明，
+          //    否则抛 "cannot get property \"sessions\" without inject"（实测踩过）。
+          //    这里再做一层兜底：属性访问失败时退到 ctx.get()，并如实报错而不是白屏。
+          let api = null
+          try {
+            api = ctx?.sessions
+          } catch (e) {
+            api = null
+          }
+          if (!api && typeof ctx?.get === 'function') {
+            try { api = ctx.get('sessions') } catch (e) { api = null }
+          }
+          if (!api?.search) {
+            setSess([])
+            setSessErr('拿不到 sessions 服务（需要 inject 声明 sessions）—— 可先用手动方式：在目标会话里调用一次 lanchat_status')
+            return
+          }
           const ctrl = new AbortController()
           const res = await api.search('', ctrl.signal)
           const items = (res && res.ok === true ? res.value && res.value.items : res && res.items) || []
@@ -399,7 +414,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'remote', 'remote.settings'],
+      inject: ['slots', 'remote', 'remote.settings', 'sessions'],
       apply(ctx) {
         // ⚠️ 必须像参考插件那样：先 slots.inject(槽位名, 回调) 声明占用，再在回调里 register。
         //    直接 register（不 inject）会注册不上 —— 而且如果外面套了 try/catch 就会**静默失败**，
