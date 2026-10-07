@@ -24,8 +24,6 @@ import { fileURLToPath } from 'node:url'
 const fsSync = createRequire(import.meta.url)('node:fs')
 
 /** Cordis 插件名（同时也是设置页里的配置命名空间）。 */
-// exported for unit testing only: the plugin itself does not need this symbol exported.
-export { jsonSafe }
 export const name = 'lanchat-bridge'
 
 /** 需要注入的 Harness 服务（sessionController 用可选读取，缺失时降级）。 */
@@ -662,6 +660,8 @@ export function apply(ctx, rawConfig) {
       me: { type: 'object', additionalProperties: true },
       peers: { type: 'array', items: { type: 'object', additionalProperties: true } },
       files: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      wakeTarget: { type: 'string' },
+      wakeTargetHint: { type: 'string' },
     }, ['ok'])),
     async execute(args, exec) {
       refresh()
@@ -692,6 +692,12 @@ export function apply(ctx, rawConfig) {
         me: { name: me.name, nodeId: me.nodeId, port: me.port, ips: me.ips },
         peers: peers.map((p) => ({ node: p.node, name: p.name, online: p.online })),
         note: '用 peers[].name 或 node 作为 lanchat_send / lanchat_recv 的 peer 参数；peer 省略 = 群聊',
+        // 唤醒会投给哪个会话？—— 收到消息却"唤不醒 AI"时，第一个要看的字段就是它。
+        // 规则：最近一次调用过任意 lanchat_* 工具的会话就是唤醒目标。
+        wakeTarget: sessionAgent?.id ?? null,
+        wakeTargetHint: sessionAgent
+          ? '收到消息时会唤醒这个会话；想换会话，在目标会话里调用一次任意 lanchat_* 工具即可'
+          : '当前还没绑定唤醒目标：在想接收唤醒的会话里调用一次 lanchat_status 即可',
       }
       if (args.includeFiles) out.files = (await http('/dsh/files', { timeoutMs: 6000 })).json?.files ?? []
       return out
