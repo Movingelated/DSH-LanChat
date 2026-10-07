@@ -1,0 +1,33 @@
+{
+    "name":  "@local/dsh-plugin-lanchat",
+    "version":  "1.0.0",
+    "private":  true,
+    "type":  "module",
+    "description":  "LAN Chat bridge for DSH: native tools + batching + wake-up queue",
+    "meta":  {
+                 "title":  "LanChat 局域网通讯",
+                 "description":  "让 AI 通过局域网与其它机器的 DSH 对话：合并发送（避免对面被拆开唤醒）+ 收到消息自动唤醒本会话 AI。"
+             },
+    "exports":  {
+                    ".":  "./index.js",
+                    "./package.json":  "./package.json",
+                    "./locale/*.json":  "./locale/*.json",
+                    "./client":  "./client.js"
+                },
+    "files":  [
+                  "locale/*.json",
+                  "index.js",
+                  "client.js",
+                  "cordis.patch.yml",
+                  "README.md"
+              ],
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "platform":  "web",
+                               "immediately":  true
+                           }
+            }
+}

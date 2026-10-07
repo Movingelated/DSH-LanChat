@@ -1,0 +1,13 @@
+- insert:
+    - id: lanchat-bridge
+      name: '@local/dsh-plugin-lanchat'
+      config:
+        enabled: true
+        exePath: ''
+        port: 80
+        dataDir: ''
+        autoStart: true
+        allowFetchFromPeer: true
+        batchWindowMs: 30000
+        wakeDebounceMs: 4000
+        requireAgentStatus: true

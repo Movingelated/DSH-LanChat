@@ -1,0 +1,662 @@
+﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+//
+// 解决两个真实痛点：
+//  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
+//     随后到的文件就成了"另一件事"，被延迟甚至忽略 —— 明明是同一批。
+//     这里在**发送侧**暂存：同一目标的内容攒够 batchWindowMs（默认 30 秒）没有新增，才作为一整批发出去；
+//     对面收到的是一条消息、一个批次号，一次就能看全。也可以调用 lanchat_flush 立即送出。
+//  2) 收到消息唤醒：轮询到新消息后不立刻打断本会话，而是等 wakeDebounceMs 内没有新消息、
+//     且本 Agent 处于空闲状态时，才用 sessionController.prompt（mode=queue）把它作为一条用户消息投进来。
+//     如果 AI 正在处理别的事务，就只入队、不打断，等它这一轮结束再处理。
+//
+// 注入的 Harness 服务：tools、agents、sessionController（可选，缺了就只读不能唤醒）
+//
+// 注意：本插件**只 import Node 内置模块**。插件是 junction 链接安装的，真实路径在工作区，
+// 从那里解析不到 dsh 自带的包（@deepseek-ai/*），所以不能 import 它们 —— 下面自带一个
+// 与 defineTool 等价的轻量实现，并用 createRequire 探测式加载 schemastery。
+
+import { createRequire } from 'node:module'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+/** Cordis 插件名（同时也是设置页里的配置命名空间）。 */
+export const name = 'lanchat-bridge'
+
+/** 需要注入的 Harness 服务（sessionController 用可选读取，缺失时降级）。 */
+export const inject = ['tools', 'agents']
+
+// ------------------------------------------------------------------ schemastery（探测式加载）
+// ⚠️ 血的教训：本机存在**两份**同名同版本的 schemastery：
+//      dsh 自带：     ...\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\schemastery
+//      profile 里的： ...\.dsh\profiles\web\node_modules\@deepseek-ai\schemastery
+//    两者是**不同的模块实例**。DSH 投影配置 schema 时会做实例识别，喂"另一个实例"会被判成
+//    status: absent —— 表现就是「设置页拿不到本插件的配置」。
+//    所以**必须优先从 dsh 入口(process.argv[1])解析**，这个基准顺序不能改。
+function loadSchemastery() {
+  const bases = []
+  const entry = String(process.argv[1] ?? '')
+  if (entry) bases.push(entry)
+  const at = entry.lastIndexOf('node_modules')
+  if (at > 0) bases.push(path.join(entry.slice(0, at + 'node_modules'.length), 'index.js'))
+  const profileDir = String(process.env.DSH_PROFILE_DIR ?? '').trim()
+  if (profileDir) bases.push(path.join(profileDir, 'index.js'))
+  const home = String(process.env.DSH_HOME ?? '').trim()
+  const profName = String(process.env.DSH_PROFILE ?? '').trim()
+  if (home && profName) bases.push(path.join(home, 'profiles', profName, 'index.js'))
+  for (const base of bases) {
+    try {
+      const mod = createRequire(base)('@deepseek-ai/schemastery')
+      if (mod && typeof mod.object === 'function') return mod
+      if (mod?.default && typeof mod.default.object === 'function') return mod.default
+    } catch { /* 换下一个基准 */ }
+  }
+  return null
+}
+
+const z = loadSchemastery()
+
+/**
+ * 配置 schema —— **这是设置页能写的前提**。
+ *
+ * 规则（DSH 的实际行为）：只有 `.volatile()` 的字段才被投影成可编辑表单，
+ * 非 volatile 字段既不出现在表单里、写入也会被拒绝；volatile 字段在插件里拿到的是
+ * "活引用"（用 .get() 读），所以设置页改完立即生效、无需重启，值落在 profile patch 里。
+ */
+export const Config = z
+  ? z.object({
+      enabled: z.boolean().default(true).volatile(),
+      exePath: z.string().default('').volatile(),
+      port: z.number().default(80).volatile(),
+      dataDir: z.string().default('').volatile(),
+      autoStart: z.boolean().default(true).volatile(),
+      allowFetchFromPeer: z.boolean().default(true).volatile(),
+      batchWindowMs: z.number().default(30000).volatile(),
+      wakeDebounceMs: z.number().default(4000).volatile(),
+      requireAgentStatus: z.boolean().default(true).volatile(),
+    })
+  : undefined
+
+/** volatile 字段是活引用，普通字段就是普通值。 */
+function deref(v) {
+  return v !== null && typeof v === 'object' && typeof v.get === 'function' ? v.get() : v
+}
+/** 取值：空字符串 / undefined 视为未配置，用兜底值。 */
+function pick(config, key, fallback) {
+  const v = deref(config?.[key])
+  return v === undefined || v === null || v === '' ? fallback : v
+}
+
+// ------------------------------------------------------------------ 工具定义辅助（自带，无外部依赖）
+/** 简写参数规格 -> JSON Schema（等价于 dsh-tools 的 parameterSchemaSpecToJsonSchema）。 */
+function specToJsonSchema(parameters) {
+  const properties = {}
+  const required = []
+  for (const [key, spec] of Object.entries(parameters ?? {})) {
+    const s = spec ?? {}
+    const node = { type: s.type ?? 'string' }
+    if (s.type === 'number' || s.type === 'integer') node.type = 'number'
+    if (Array.isArray(s.enum) && s.enum.length > 0) node.enum = s.enum
+    if (s.description) node.description = s.description
+    if (s.default !== undefined) node.default = s.default
+    properties[key] = node
+    if (s.required === true) required.push(key)
+  }
+  const schema = { type: 'object', properties }
+  if (required.length > 0) schema.required = required
+  schema.additionalProperties = false
+  return schema
+}
+
+/** 定义工具（对齐 ToolDefinition：name/description/parameters/output/execute）。 */
+function defineTool(options) {
+  return {
+    name: options.name,
+    description: options.description,
+    parameters: specToJsonSchema(options.parameters),
+    output: options.output,
+    async execute(args, exec) {
+      refresh()
+      return options.execute(args ?? {}, exec)
+    },
+  }
+}
+
+/** 统一的 JSON 输出渲染（与 dsh-tools 的 jsonOutput 等价）。 */
+function jsonOutput(schema) {
+  return {
+    schema,
+    render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 1) }],
+  }
+}
+
+// ------------------------------------------------------------------ 配置默认值（无 Config schema，允许热改）
+const DEFAULTS = {
+  exePath: '',
+  port: 80,
+  dataDir: '',
+  batchWindowMs: 30000,
+  wakeDebounceMs: 4000,
+  autoStart: true,
+  allowFetchFromPeer: true,
+  requireAgentStatus: true,
+}
+
+/** 本插件自己的目录 —— 发布包里 LanChat.exe 就和插件放在一起，优先从这里找。 */
+const PLUGIN_DIR = (() => {
+  try { return path.dirname(fileURLToPath(import.meta.url)) } catch { return '' }
+})()
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function log(msg) {
+  console.log(`[lanchat] ${msg}`)
+}
+function logErr(msg) {
+  console.error(`[lanchat] ${msg}`)
+}
+
+export function apply(ctx, rawConfig) {
+  // 配置按"实时"读取：volatile 字段是活引用，设置页改完立刻反映到下面这些 getter，
+  // 所以不需要重启，也不需要缓存快照。
+  const D = DEFAULTS
+  const read = () => ({
+    enabled: pick(rawConfig, 'enabled', D.enabled) !== false,
+    exePath: String(pick(rawConfig, 'exePath', D.exePath) ?? ''),
+    port: Number(pick(rawConfig, 'port', D.port)) || 80,
+    dataDir: String(pick(rawConfig, 'dataDir', D.dataDir) ?? ''),
+    batchWindowMs: Number(pick(rawConfig, 'batchWindowMs', D.batchWindowMs)) || 30000,
+    wakeDebounceMs: Number(pick(rawConfig, 'wakeDebounceMs', D.wakeDebounceMs)) || 4000,
+    autoStart: pick(rawConfig, 'autoStart', D.autoStart) !== false,
+    allowFetchFromPeer: pick(rawConfig, 'allowFetchFromPeer', D.allowFetchFromPeer) !== false,
+    requireAgentStatus: pick(rawConfig, 'requireAgentStatus', D.requireAgentStatus) !== false,
+  })
+  const cfg = read()
+  const baseOf = (c) => `http://127.0.0.1:${c.port}`
+  let base = baseOf(cfg)
+
+  // 设置页改完立即生效：每次用之前刷新一次配置。
+  // 端口变了就换地址并让收消息循环重连（只重连一次，不会抖动）。
+  function refresh() {
+    const next = read()
+    if (next.port !== cfg.port) {
+      cfg.port = next.port
+      base = baseOf(cfg)
+      reconnect = true
+      log(`端口已按设置改为 ${cfg.port}，正在重连…`)
+    }
+    cfg.enabled = next.enabled
+    cfg.exePath = next.exePath
+    cfg.dataDir = next.dataDir
+    cfg.batchWindowMs = next.batchWindowMs
+    cfg.wakeDebounceMs = next.wakeDebounceMs
+    cfg.autoStart = next.autoStart
+    cfg.allowFetchFromPeer = next.allowFetchFromPeer
+    cfg.requireAgentStatus = next.requireAgentStatus
+    if (!next.enabled) {
+      for (const b of buffers.values()) clearTimeout(b.wakeTimer)
+      buffers.clear()
+    }
+    return cfg
+  }
+
+  let selfNodeId = ''
+  let stopped = false
+  /** 端口被设置页改过 → 需要重连一次 */
+  let reconnect = false
+  /** 是否收到过 agent/status 事件（0.1.7 及更早没有这个事件） */
+  let statusEventsSeen = false
+  /** 本会话 Agent（第一次调用任意工具时确定，背景线程靠它决定投给谁） */
+  let sessionAgent = null
+  /** Agent 运行状态：agentId -> 'idle' | 'running'，来自 agent/status 事件 */
+  const agentStatus = new Map()
+  /** 收件缓冲：convKey -> { peer, items[], lastAt, wakeTimer } */
+  const buffers = new Map()
+
+  // ---------------------------------------------------------------- HTTP
+  async function http(path, init) {
+    const ctl = new AbortController()
+    const t = setTimeout(() => ctl.abort(), init?.timeoutMs ?? 20000)
+    try {
+      const res = await fetch(base + path, { ...init, signal: ctl.signal })
+      const text = await res.text()
+      let json = null
+      try { json = JSON.parse(text) } catch { /* 非 JSON 响应（如 /dsh/doc） */ }
+      return { ok: res.ok, status: res.status, text, json }
+    } finally {
+      clearTimeout(t)
+    }
+  }
+
+  async function whoami() {
+    try {
+      const r = await http('/dsh/whoami', { timeoutMs: 3000 })
+      if (r.json?.ok) { selfNodeId = r.json.nodeId ?? ''; return r.json }
+      return null
+    } catch { return null }
+  }
+
+  // ---------------------------------------------------------------- 状态事件
+  //
+  // 兼容性说明：`agent/status` 事件是 DSH 0.2.0 起才有的，0.1.7-rc.2 上收不到。
+  // 收不到时 statusEventsSeen 保持 false，isBusy() 退化为"状态未知" —— 那时不再自己判忙，
+  // 而是直接交给 sessionController.prompt(mode:'queue')：它本身就有"正在跑就排队、空闲才起跑"的语义，
+  // 功能仍然正确，只是唤醒时机的判断不如有事件时精确。
+  ctx.on('agent/status', (payload) => {
+    statusEventsSeen = true
+    const id = payload?.agent?.id
+    if (id) agentStatus.set(String(id), payload.status === 'running' ? 'running' : 'idle')
+  })
+
+  function isBusy() {
+    if (!sessionAgent) return false
+    if (!statusEventsSeen) return false        // 老版本 DSH：状态未知 → 交给 queue 语义
+    return agentStatus.get(String(sessionAgent.id)) === 'running'
+  }
+
+  // ---------------------------------------------------------------- 查找 / 拉起 LanChat
+  /** 按优先级列出可能存放 LanChat.exe 的位置（不含任何硬编码的个人路径）。 */
+  function candidatePaths() {
+    const out = []
+    if (cfg.exePath) out.push(cfg.exePath)
+    const cwd = process.cwd()
+    out.push(`${cwd}\\LanChat.exe`)
+    out.push(`${cwd}\\lanchat\\LanChat.exe`)
+    out.push(`${cwd}\\dsh-plugin-lanchat\\LanChat.exe`)     // 从发布包根目录直接解压的情况
+    out.push(`${cwd}\\..\\LanChat.exe`)
+    if (process.env.LOCALAPPDATA) out.push(`${process.env.LOCALAPPDATA}\\LanChat\\LanChat.exe`)
+    if (process.env.ProgramFiles) out.push(`${process.env.ProgramFiles}\\LanChat\\LanChat.exe`)
+    if (process.env.ProgramFiles) out.push(`${process.env.ProgramFiles(x86)}\\LanChat\\LanChat.exe`)
+    if (process.env.USERPROFILE) out.push(`${process.env.USERPROFILE}\\Desktop\\LanChat.exe`)
+    if (process.env.USERPROFILE) out.push(`${process.env.USERPROFILE}\\Downloads\\LanChat.exe`)
+    return out
+  }
+
+  async function findLocalExe() {
+    const fs = await import('node:fs/promises')
+    for (const p of candidatePaths()) {
+      if (!p) continue
+      try { await fs.access(p); return p } catch { /* 试下一个 */ }
+    }
+    return ''
+  }
+
+  /** 本机没有就从局域网里其它机器的 /dsh/self 拉一份（这就是"自动获取 LanChat"） */
+  async function fetchExeFromPeer() {
+    if (!cfg.allowFetchFromPeer) return ''
+    try {
+      const peers = (await http('/dsh/peers', { timeoutMs: 5000 })).json?.peers ?? []
+      for (const p of peers) {
+        if (!p?.node || !p?.online) continue
+        try {
+          const res = await fetch(`http://${p.node}/dsh/self`)
+          if (!res.ok) continue
+          const buf = Buffer.from(await res.arrayBuffer())
+          if (buf.length < 100000) continue
+          const fs = await import('node:fs/promises')
+          const path = await import('node:path')
+          const dir = `${process.env.LOCALAPPDATA ?? process.cwd()}\\LanChat`
+          await fs.mkdir(dir, { recursive: true })
+          const dst = path.join(dir, 'LanChat.exe')
+          await fs.writeFile(dst, buf)
+          log(`已从局域网机器 ${p.name || p.node} 取得 LanChat.exe（${buf.length} 字节）`)
+          return dst
+        } catch { /* 换下一台 */ }
+      }
+    } catch { /* 忽略 */ }
+    return ''
+  }
+
+  async function ensureRunning() {
+    const me = await whoami()
+    if (me) return me
+    if (!cfg.autoStart) return null
+
+    let exe = await findLocalExe()
+    if (!exe) exe = await fetchExeFromPeer()
+    if (!exe) {
+      logErr('找不到 LanChat.exe：请在插件配置里填 exePath，或先手动运行一次 LanChat')
+      return null
+    }
+    // 不依赖 Harness 的 subprocess 服务：那会把 LanChat 变成"受管进程"，DSH 一退出就被杀。
+    // 这里用 node 原生 spawn 脱离式启动，进程归属用户自己，与手动双击 exe 等价。
+    try {
+      // ⚠️ 两条铁律，改回去会出真事故：
+      //
+      // ① 绝不加 --nogui：那会**隐藏托盘图标**。LanChat 是可独立运行的软件，
+      //    即便由插件拉起，也要和手动启动一样常驻托盘、右键有菜单、双击打开 WebUI。
+      //    只用 --no-browser：托盘照常，但不在 DSH 启动时抢开浏览器窗口。
+      //
+      // ② 用 node 的 child_process **脱离式**启动（detached + unref），
+      //    **不要**用 ctx.subprocess：Harness 的 subprocess 服务在销毁时会终止所有
+      //    托管进程 —— 那样一关 DSH 就会把 LanChat 一起杀掉。本插件只做接口适配，
+      //    LanChat 的运行必须完全独立于 DSH，直到用户从托盘手动退出。
+      const args = ['--no-browser']
+      if (cfg.dataDir) args.push(`--data=${cfg.dataDir}`)
+      const child = spawn(exe, args, {
+        cwd: cfg.dataDir || path.dirname(exe),
+        detached: true,        // 独立进程组：DSH 退出不影响它
+        stdio: 'ignore',       // 不占管道，父进程退出后不会因为管道断开而受影响
+        windowsHide: false,
+      })
+      child.unref()            // 不把子进程留在父进程的事件循环里
+      log(`已启动 LanChat（脱离式，托盘保留，DSH 退出后继续运行）: ${exe}`)
+    } catch (e) {
+      logErr(`启动 LanChat 失败: ${e?.message ?? e}`)
+      return null
+    }
+    for (let i = 0; i < 40 && !stopped; i++) {
+      await sleep(250)
+      const got = await whoami()
+      if (got) return got
+    }
+    logErr('LanChat 启动后仍未响应：检查端口占用或防火墙提示')
+    return null
+  }
+
+  // ---------------------------------------------------------------- 唤醒
+  async function deliver(convKey) {
+    if (!refresh().enabled) return
+    const b = buffers.get(convKey)
+    if (!b || b.items.length === 0) return
+    if (!sessionAgent) {
+      logErr('尚未确定本会话 Agent（本会话还没调用过 LanChat 工具），消息留在缓冲里')
+      return
+    }
+    const sc = ctx.get('sessionController')
+    if (!sc?.prompt) {
+      logErr('缺少 sessionController 服务，无法唤醒本会话 AI')
+      return
+    }
+    const n = b.items.length
+    const body = [
+      `【LanChat 收到${n > 1 ? ` ${n} 条消息（同一批，请一并处理）` : '消息'}｜来自 ${b.peer}｜会话键 ${convKey}】`,
+      ...b.items,
+      '',
+      '（自动唤醒提示。请调用 lanchat_recv 拿完整内容与文件路径；回复用 lanchat_send。' +
+      '若这是需要与对方持续对话的场景，处理完后可用 lanchat_recv 的 waitSeconds 继续等下一批。）',
+    ].join('\n---\n')
+    const busy = isBusy()
+    try {
+      await sc.prompt({
+        requestId: `lanchat-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        sessionId: sessionAgent.id,
+        mode: 'queue',
+        content: [{ type: 'text', text: body }],
+      })
+      buffers.delete(convKey)
+      log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer}`)
+    } catch (e) {
+      logErr(`投递失败，消息留在缓冲稍后重试: ${e?.message ?? e}`)
+      b.lastAt = Date.now()
+      scheduleWake(convKey)
+    }
+  }
+
+  function scheduleWake(convKey) {
+    const b = buffers.get(convKey)
+    if (!b) return
+    clearTimeout(b.wakeTimer)
+    // 关键：不是"来了就唤醒"，而是等到这段安静时间过去、且 AI 空闲时才唤醒。
+    // 同一批被拆成几条到达也不会唤醒两次，更不会让 AI 漏看后到的那条。
+    b.wakeTimer = setTimeout(async function tick() {
+      if (stopped) return
+      const cur = buffers.get(convKey)
+      if (!cur || cur.items.length === 0) return
+      if (Date.now() - cur.lastAt < cfg.wakeDebounceMs) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
+      if (cfg.requireAgentStatus && isBusy()) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
+      await deliver(convKey)
+    }, cfg.wakeDebounceMs)
+  }
+
+  // ---------------------------------------------------------------- 后台收消息
+  async function pollLoop() {
+    let me = await ensureRunning()
+    while (!me && !stopped) {
+      await sleep(15000)
+      me = await ensureRunning()
+    }
+    if (stopped) return
+    log(`已连接 LanChat（本机 ${selfNodeId || '未知'}，版本 ${me.version ?? '?'}）`)
+
+    while (!stopped) {
+      // 设置页可以随时改配置：启用开关、端口变化都在这里即时生效
+      if (!refresh().enabled) { await sleep(1500); continue }
+      if (reconnect) {
+        reconnect = false
+        const again = await ensureRunning()
+        if (again) log('已按新设置重连 LanChat')
+      }
+      try {
+        const r = await http('/dsh/recv?timeout=20', { timeoutMs: 32000 })
+        const j = r.json
+        if (!j?.ok) { await sleep(2000); continue }
+        const convKey = j.key ?? 'public'
+        for (const m of j.messages ?? []) {
+          if (m.mine) continue                          // 自己发的消息不唤醒自己
+          let b = buffers.get(convKey)
+          if (!b) { b = { peer: m.from ?? '未知', items: [], lastAt: 0, wakeTimer: null }; buffers.set(convKey, b) }
+          b.peer = m.from ?? b.peer
+          const files = m.files?.length ? `（含 ${m.files.length} 个文件：${m.files.map((f) => f.name).join(', ')}）` : ''
+          b.items.push(`【来自 ${m.from}${m.batch ? `｜批次 ${m.batch}` : ''}】${m.text ?? ''}${files}`)
+          b.lastAt = Date.now()
+          scheduleWake(convKey)
+        }
+      } catch {
+        await sleep(3000)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- 工具
+
+  function remember(exec) {
+    if (exec?.agent && !sessionAgent) {
+      sessionAgent = exec.agent
+      log(`本会话 Agent 已绑定: ${exec.agent.id}`)
+    }
+  }
+
+  const OBJ = (props, required) => ({ type: 'object', properties: props, required, additionalProperties: true })
+
+  ctx.tools.register(defineTool({
+    name: 'lanchat_status',
+    description:
+      '查看 LanChat 局域网通讯状态：本机名称/节点号、当前在线的其它机器、最近收到的文件。' +
+      '要与别的机器通讯前先调用它确认对方在线。',
+    parameters: {
+      includeFiles: { type: 'boolean', description: '是否同时列出最近的文件（默认 false）' },
+    },
+    output: jsonOutput(OBJ({
+      ok: { type: 'boolean' },
+      me: { type: 'object', additionalProperties: true },
+      peers: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      files: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    }, ['ok'])),
+    async execute(args, exec) {
+      refresh()
+      remember(exec)
+      const me = await whoami()
+      if (!me) return { ok: false, error: 'LanChat 未运行或端口不通（检查插件配置的 port / exePath）' }
+      const peers = (await http('/dsh/peers', { timeoutMs: 6000 })).json?.peers ?? []
+      const out = {
+        ok: true,
+        me: { name: me.name, nodeId: me.nodeId, port: me.port, ips: me.ips },
+        peers: peers.map((p) => ({ node: p.node, name: p.name, online: p.online })),
+        note: '用 peers[].name 或 node 作为 lanchat_send / lanchat_recv 的 peer 参数；peer 省略 = 群聊',
+      }
+      if (args.includeFiles) out.files = (await http('/dsh/files', { timeoutMs: 6000 })).json?.files ?? []
+      return out
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'lanchat_recv',
+    description:
+      '读取局域网消息。peer 省略 = 群聊，给了 = 与那台机器的私聊（只有你们两人看得到）。' +
+      '返回值里 next 是游标：下次调用把它当 since。自己发的消息 mine=true，不要回复自己。' +
+      'waitSeconds>0 时若无新消息会挂起等待（长轮询，推荐 15-25），适合等对方回复。' +
+      '收到"LanChat 收到消息"的唤醒提示后调用本工具即可拿到完整正文与文件磁盘路径。',
+    parameters: {
+      peer: { type: 'string', description: '对方机器名或节点号（如 DESKTOP-ABC 或 192.168.0.5:80）；省略 = 群聊' },
+      since: { type: 'number', description: '游标：上次返回的 next；首次传 0' },
+      waitSeconds: { type: 'number', description: '长轮询等待秒数（0-25），默认 0 立即返回' },
+    },
+    output: jsonOutput(OBJ({
+      ok: { type: 'boolean' },
+      key: { type: 'string' },
+      next: { type: 'number' },
+      count: { type: 'number' },
+      messages: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    }, ['ok'])),
+    async execute(args, exec) {
+      refresh()
+      remember(exec)
+      const wait = Math.max(0, Math.min(25, Number(args.waitSeconds ?? 0) || 0))
+      const q = [`since=${Number(args.since ?? 0) || 0}`, `timeout=${wait}`]
+      if (args.peer && args.peer !== 'all' && args.peer !== 'public') q.push(`peer=${encodeURIComponent(args.peer)}`)
+      const r = await http(`/dsh/recv?${q.join('&')}`, { timeoutMs: wait * 1000 + 15000 })
+      const j = r.json
+      if (!j?.ok) return { ok: false, error: `LanChat 无响应 (HTTP ${r.status})` }
+      // 已经通过工具读到了，就不要再唤醒一次
+      if (j.key) {
+        const b = buffers.get(j.key)
+        if (b) { clearTimeout(b.wakeTimer); buffers.delete(j.key) }
+      }
+      const out = { ok: true, key: j.key, next: j.next, count: j.count, messages: j.messages ?? [] }
+      if (j.count === 0) out.hint = '暂无新消息；可用刚返回的 next 作为 since 再等一次'
+      return out
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'lanchat_send',
+    description:
+      '向局域网其它机器发消息或文件。**默认合并发送**：同一目标连续发送的内容会攒成一批' +
+      `（空闲 ${Math.round(cfg.batchWindowMs / 1000)} 秒后自动发出，或调用 lanchat_flush 立即发出），` +
+      '对面收到的是一条消息 + 一个批次号，能一次看全 —— 避免"文字先到把对面 AI 唤醒、文件后到被忽略"。' +
+      '**要发文字 + 文件、或连续说几句时：连续调用本工具，最后调用一次 lanchat_flush。**' +
+      'mode=now 表示不合并、立刻单独发出（只适合一句话且不带文件的场景）。',
+    parameters: {
+      text: { type: 'string', description: '要发送的文字（可与 file 同时给）' },
+      file: { type: 'string', description: '要发送的本地文件绝对路径' },
+      peer: { type: 'string', description: '对方机器名或节点号；省略 = 群聊' },
+      mode: { type: 'string', enum: ['stage', 'flush', 'now'], description: 'stage=攒批(默认)、flush=攒批并立即发出、now=立刻单独发出' },
+      kind: { type: 'string', description: '内容类型提示：image 表示图片（图片不参与合并，避免对方干等）' },
+    },
+    output: jsonOutput(OBJ({
+      ok: { type: 'boolean' },
+      staged: { type: 'boolean' },
+      flushed: { type: 'boolean' },
+      items: { type: 'number' },
+      remainingMs: { type: 'number' },
+      note: { type: 'string' },
+    }, ['ok'])),
+    async execute(args, exec) {
+      refresh()
+      remember(exec)
+      if (!args.text && !args.file) return { ok: false, error: '至少要给 text 或 file 之一' }
+      const payload = { text: args.text, file: args.file, peer: args.peer, kind: args.kind }
+      if (args.mode === 'now') {
+        const r = await http('/dsh/stage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ ...payload, flush: true, autoBatch: false }),
+          timeoutMs: 60000,
+        })
+        return { ok: r.json?.ok === true, flushed: true, note: '已立刻单独发出（未合并）' }
+      }
+      const body = { ...payload }
+      if (args.mode === 'flush') body.flush = true
+      const r = await http('/dsh/stage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body),
+        timeoutMs: 60000,
+      })
+      const j = r.json ?? {}
+      const win = Math.round((j.window_ms ?? cfg.batchWindowMs) / 1000)
+      return {
+        ok: j.ok === true,
+        staged: j.staged === true,
+        flushed: j.flushed === true,
+        items: j.items,
+        remainingMs: j.window_ms,
+        note: j.flushed
+          ? '已作为一整批发给对面'
+          : `已攒入本批（当前 ${j.items ?? 1} 件）。还要发就继续调用 lanchat_send；发完请调用 lanchat_flush 立即送出，否则 ${win} 秒后自动发出。`,
+        error: j.error,
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'lanchat_flush',
+    description:
+      '把攒着的一批内容立即送给对面。**一轮对话里把所有内容都发完后调用一次**，这样对面马上收到完整的一批，不用等自动窗口。',
+    parameters: {
+      peer: { type: 'string', description: '目标机器名或节点号；省略 = 群聊' },
+    },
+    output: jsonOutput(OBJ({ ok: { type: 'boolean' }, flushed: { type: 'boolean' } }, ['ok'])),
+    async execute(args, exec) {
+      refresh()
+      remember(exec)
+      const q = args.peer && args.peer !== 'all' ? `?to=${encodeURIComponent(args.peer)}` : ''
+      const r = await http(`/dsh/stage/flush${q}`, { timeoutMs: 60000 })
+      return { ok: r.json?.ok === true, flushed: r.json?.flushed === true }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'lanchat_identity',
+    description: '查看或修改本机在局域网里的名称与头像颜色（改动会自动同步给所有机器，重名/撞色自动避让）。',
+    parameters: {
+      name: { type: 'string', description: '新名称（可选）' },
+      color: { type: 'string', description: '头像颜色 6 位十六进制，如 7bc7f4（可选）' },
+    },
+    output: jsonOutput(OBJ({
+      ok: { type: 'boolean' },
+      name: { type: 'string' },
+      letter: { type: 'string' },
+      color: { type: 'string' },
+    }, ['ok'])),
+    async execute(args, exec) {
+      refresh()
+      remember(exec)
+      if (args.name || args.color) {
+        const r = await http('/dsh/setid', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ name: args.name, color: args.color }),
+          timeoutMs: 15000,
+        })
+        const j = r.json ?? {}
+        return { ok: j.ok === true, name: j.name, letter: j.letter, color: j.color }
+      }
+      const j = (await http('/dsh/whoami', { timeoutMs: 6000 })).json ?? {}
+      return { ok: j.ok === true, name: j.name, letter: j.letter, color: j.color }
+    },
+  }))
+
+  // ---------------------------------------------------------------- 生命周期
+  ctx.effect(() => {
+    stopped = false
+    pollLoop().catch((e) => logErr(`收消息循环异常退出: ${e?.message ?? e}`))
+    return () => {
+      stopped = true
+      for (const b of buffers.values()) clearTimeout(b.wakeTimer)
+      buffers.clear()
+      // ⚠️ 刻意**不**终止 LanChat：它的生命周期完全独立于 DSH。
+      //    关掉 DSH 后 LanChat 继续运行（托盘常驻），直到用户自己从托盘"退出"。
+      //    插件只是接口适配层，不拥有这个进程。
+    }
+  })
+
+// 版本兼容探测：agent/status 是 0.2.0 起才有的，晚一点看它有没有来过
+  setTimeout(() => {
+    if (!stopped && !statusEventsSeen) {
+      log('本机 DSH 未提供 agent/status 事件（0.1.7 及更早）→ 唤醒时机的判忙退化为 queue 语义，功能不受影响')
+    }
+  }, 5000)
+  log(`已加载（端口 ${cfg.port}｜合并窗口 ${cfg.batchWindowMs}ms｜唤醒防抖 ${cfg.wakeDebounceMs}ms）`)
+}

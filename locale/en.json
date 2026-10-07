@@ -1,0 +1,4 @@
+{
+  "title": "LanChat LAN Messaging",
+  "description": "Let the AI talk to DSH on other machines over the LAN: batched sending (so the peer is not woken up mid-batch) and automatic wake-up of this session when messages arrive."
+}
