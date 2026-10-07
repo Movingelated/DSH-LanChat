@@ -318,8 +318,18 @@ export function apply(ctx, rawConfig) {
   let statusEventsSeen = false
   /** 本会话 Agent（第一次调用任意工具时确定，背景线程靠它决定投给谁） */
   let sessionAgent = null
-  /** Agent 运行状态：agentId -> 'idle' | 'running'，来自 agent/status 事件 */
+  /**
+   * Agent 运行状态：agentId -> { status: 'idle'|'running', at: 时刻 }，来自 agent/status 事件。
+   * ⚠️ 必须带时刻：只记字符串的话，一旦收到 running 而对应的 idle 没到（作用域过滤/漏事件/id 不一致），
+   *    isBusy() 会**永远为 true** → 每 4 秒静默重排、永不投递、且不留任何日志（实测事故，B机 定位）。
+   */
   const agentStatus = new Map()
+  /** 已见过的 status 事件 id（用于一次性诊断"id 是否与本会话一致"） */
+  const statusIdsSeen = new Set()
+  /** running 超过这么久仍无 idle 跟随 ⇒ 视为陈旧，按"不忙"处理（毫秒） */
+  const STALE_RUNNING_MS = 30000
+  /** 连续推迟的绝对上限：超过就直接投递（毫秒）。queue 语义本身不会打断本轮，所以这样做是安全的。 */
+  const MAX_POSTPONE_MS = 60000
   /** 收件缓冲：convKey -> { peer, items[], lastAt, wakeTimer } */
   const buffers = new Map()
 
@@ -355,14 +365,37 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/status', (payload) => {
     statusEventsSeen = true
     const id = payload?.agent?.id
-    if (id) agentStatus.set(String(id), payload.status === 'running' ? 'running' : 'idle')
+    if (!id) return
+    const key = String(id)
+    agentStatus.set(key, { status: payload.status === 'running' ? 'running' : 'idle', at: Date.now() })
+    // 首次见到某个 id 时做一次诊断：DSH 的 agent/status 是**按作用域过滤**派发的；
+    // 若收到的 id 始终不是本会话的，判忙就永远无从复位 —— 必须能一眼看出来。
+    if (!statusIdsSeen.has(key)) {
+      statusIdsSeen.add(key)
+      log(`agent/status 首次收到 id=${key.slice(0, 12)}…（status=${payload.status}）`
+        + (sessionAgent && key !== String(sessionAgent.id)
+          ? `；⚠ 与本会话 id=${String(sessionAgent.id).slice(0, 12)}… 不同` : ''))
+    }
   })
 
-  function isBusy() {
-    if (!sessionAgent) return false
-    if (!statusEventsSeen) return false        // 老版本 DSH：状态未知 → 交给 queue 语义
-    return agentStatus.get(String(sessionAgent.id)) === 'running'
+  /**
+   * 判忙（带原因）。三档：
+   *   ① 未绑定会话 / 未观测到状态事件 / 无记录 ⇒ 不忙（交给 queue 语义）
+   *   ② running 但**已陈旧**（超过 STALE_RUNNING_MS 没有 idle 跟随）⇒ 不忙（防"卡死在 running"）
+   *   ③ running 且新鲜 ⇒ 忙
+   */
+  function busyState() {
+    if (!sessionAgent) return { busy: false, why: '未绑定会话' }
+    if (!statusEventsSeen) return { busy: false, why: '未观测到 agent/status（交给 queue 语义）' }
+    const rec = agentStatus.get(String(sessionAgent.id))
+    if (!rec || rec.status !== 'running') return { busy: false, why: '空闲' }
+    const age = Date.now() - (rec.at || 0)
+    if (age > STALE_RUNNING_MS) {
+      return { busy: false, why: `running 状态已陈旧 ${Math.round(age / 1000)}s（无 idle 跟随，按不忙处理）` }
+    }
+    return { busy: true, why: `running（${Math.round(age / 1000)}s 前进入）` }
   }
+  function isBusy() { return busyState().busy }
 
   // ---------------------------------------------------------------- 查找 / 拉起 LanChat
   /** 按优先级列出可能存放 LanChat.exe 的位置（不含任何硬编码的个人路径）。 */
@@ -584,7 +617,23 @@ export function apply(ctx, rawConfig) {
         const cur = buffers.get(convKey)
         if (!cur || cur.items.length === 0) return
         if (Date.now() - cur.lastAt < cfg.wakeDebounceMs) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
-        if (cfg.requireAgentStatus && isBusy()) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
+        if (cfg.requireAgentStatus) {
+          const b = busyState()
+          cur.firstAt = cur.firstAt || Date.now()
+          const waited = Date.now() - cur.firstAt
+          if (b.busy && waited < MAX_POSTPONE_MS) {
+            // 推迟**必须留痕**：静默重排是本插件最难查的一类故障（实测事故：0 唤醒 / 0 丢弃 / 0 报错）
+            if (Date.now() - (cur.lastBusyLog || 0) > 20000) {
+              cur.lastBusyLog = Date.now()
+              log(`因判忙推迟投递（已等 ${Math.round(waited / 1000)}s／上限 ${MAX_POSTPONE_MS / 1000}s）：${b.why}；${cur.items.length} 条来自 ${cur.peer}`)
+            }
+            cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs)
+            return
+          }
+          if (b.busy) {
+            log(`判忙等待已达上限 ${Math.round(waited / 1000)}s，改为直接投递（queue 不会打断本轮）：${b.why}`)
+          }
+        }
         await deliver(convKey)
       } catch (e) {
         logErr(`唤醒流程异常（已忽略，不影响 DSH）: ${e?.message ?? e}`)
@@ -641,7 +690,7 @@ export function apply(ctx, rawConfig) {
         for (const m of j.messages ?? []) {
           if (m.mine) continue                          // 自己发的消息不唤醒自己
           let b = buffers.get(convKey)
-          if (!b) { b = { peer: m.from ?? '未知', items: [], lastAt: 0, wakeTimer: null }; buffers.set(convKey, b) }
+          if (!b) { b = { peer: m.from ?? '未知', items: [], lastAt: 0, wakeTimer: null, firstAt: 0 }; buffers.set(convKey, b) }
           b.peer = m.from ?? b.peer
           const files = m.files?.length ? `（含 ${m.files.length} 个文件：${m.files.map((f) => f.name).join(', ')}）` : ''
           b.items.push(`【来自 ${m.from}${m.batch ? `｜批次 ${m.batch}` : ''}】${m.text ?? ''}${files}`)
