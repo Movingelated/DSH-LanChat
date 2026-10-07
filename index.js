@@ -667,7 +667,12 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  const OBJ = (props, required) => ({ type: 'object', properties: props, required, additionalProperties: true })
+  /** 可空字段：`{ oneOf: [T, null] }`。用于"本次不适用"的返回值 ——
+ *  jsonSafe 会把 undefined 变成 null，若 schema 只写 boolean/number 就会校验失败，
+ *  进而把"发送成功"报成失败（实测踩过：整条广播被误判为发送失败）。 */
+const nullable = (type) => ({ oneOf: [{ type }, { type: 'null' }] })
+
+const OBJ = (props, required) => ({ type: 'object', properties: props, required, additionalProperties: true })
 
   // Builds the ?peer=... fragment from a name, a node id, or "ip:port".
   // Added with the v1.0.8 now-semantics fix: the immediate send path needs the target in the query.
@@ -790,11 +795,11 @@ export function apply(ctx, rawConfig) {
     output: jsonOutput(OBJ({
       ok: { type: 'boolean' },
       staged: { type: 'boolean' },
-      sent: { type: 'boolean' },
-      drained: { type: 'boolean' },
+      sent: nullable('boolean'),
+      drained: nullable('boolean'),
       flushed: { type: 'boolean' },
-      items: { type: 'number' },
-      remainingMs: { type: 'number' },
+      items: nullable('number'),
+      remainingMs: nullable('number'),
       note: { type: 'string' },
     }, ['ok'])),
     async execute(args, exec) {
