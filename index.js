@@ -1,4 +1,4 @@
-// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
 //
 // 解决两个真实痛点：
 //  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
@@ -19,6 +19,9 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+
+/** 同步 fs：ESM 里没有 require，用 createRequire 取一个（日志要同步落盘，不能丢） */
+const fsSync = createRequire(import.meta.url)('node:fs')
 
 /** Cordis 插件名（同时也是设置页里的配置命名空间）。 */
 export const name = 'lanchat-bridge'
@@ -150,11 +153,54 @@ const PLUGIN_DIR = (() => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// ---------------------------------------------------------------- 日志（同时写文件，便于事后取证）
+// 为什么落盘：插件日志默认只进 DSH 的终端，一旦 DSH 自己退出，现场就没了。
+// 日志放在 %LOCALAPPDATA%\LanChat\dsh-plugin.log，超过 1 MB 自动截断重开。
+const LOG_FILE = (() => {
+  try {
+    const base = process.env.LOCALAPPDATA || process.env.TEMP || process.cwd()
+    return path.join(base, 'LanChat', 'dsh-plugin.log')
+  } catch { return '' }
+})()
+
+function writeLog(line) {
+  if (!LOG_FILE) return
+  try {
+    const fs = fsSync
+    const dir = path.dirname(LOG_FILE)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    try { if (fs.statSync(LOG_FILE).size > 1024 * 1024) fs.writeFileSync(LOG_FILE, '') } catch { }
+    fs.appendFileSync(LOG_FILE, line + '\n')
+  } catch { /* 日志失败绝不能影响主流程 */ }
+}
+
+function stamp() {
+  try { return new Date().toISOString().replace('T', ' ').slice(0, 19) } catch { return '' }
+}
 function log(msg) {
-  console.log(`[lanchat] ${msg}`)
+  const line = `[lanchat] ${msg}`
+  console.log(line)
+  writeLog(`${stamp()} ${line}`)
 }
 function logErr(msg) {
-  console.error(`[lanchat] ${msg}`)
+  const line = `[lanchat] ${msg}`
+  console.error(line)
+  writeLog(`${stamp()} [ERROR] ${line}`)
+}
+
+/** 把一个可能抛错的同步/异步动作包起来：**绝不让异常逃逸成未处理的 Promise 拒绝**
+ *  （Node 遇到未处理的拒绝会直接结束进程 —— 那会把整个 DSH 带崩）。 */
+function safely(label, fn) {
+  try {
+    const r = fn()
+    if (r && typeof r.then === 'function') {
+      return r.catch((e) => { logErr(`${label} 失败: ${e?.message ?? e}`) })
+    }
+    return r
+  } catch (e) {
+    logErr(`${label} 抛错: ${e?.message ?? e}`)
+    return undefined
+  }
 }
 
 export function apply(ctx, rawConfig) {
@@ -203,6 +249,8 @@ export function apply(ctx, rawConfig) {
 
   let selfNodeId = ''
   let stopped = false
+  /** 上次尝试拉起 LanChat 的时间（冷却用，避免反复 spawn） */
+  let lastSpawnAt = 0
   /** 上次尝试启动 LanChat 的失败原因（供 lanchat_status 诊断输出） */
   let lastStartError = ''
   /** 端口被设置页改过 → 需要重连一次 */
@@ -284,6 +332,19 @@ export function apply(ctx, rawConfig) {
     return out
   }
 
+  /** 探测某端口上是否已经有人在监听（纯 TCP 连接，3 秒超时）。 */
+  async function portListening(port) {
+    try {
+      const net = await import('node:net')
+      return await new Promise((resolve) => {
+        let done = false
+        const sock = net.connect({ host: '127.0.0.1', port }, () => { done = true; sock.destroy(); resolve(true) })
+        sock.setTimeout(3000)
+        sock.on('timeout', () => { if (!done) { done = true; sock.destroy(); resolve(false) } })
+        sock.on('error', () => { if (!done) { done = true; resolve(false) } })
+      })
+    } catch { return false }
+  }
   async function findLocalExe() {
     const fs = await import('node:fs/promises')
     for (const p of candidatePaths()) {
@@ -323,6 +384,20 @@ export function apply(ctx, rawConfig) {
     const me = await whoami()
     if (me) return me
     if (!cfg.autoStart) return null
+
+    // ① 端口探测：如果**已经有人在这个端口上监听**（可能是 LanChat 正忙、或正在启动），
+    //    就先别急着重启 —— 否则会在端口被占的情况下再 spawn 一个，制造"端口被占用"的混乱。
+    if (await portListening(cfg.port)) {
+      log(`端口 ${cfg.port} 有人在监听但接口没响应（可能在启动中），本轮不重复拉起`)
+      return null
+    }
+    // ② 启动冷却：5 分钟内最多尝试拉起一次。反复 spawn 是"端口冲突 + 进程堆积"的根源。
+    const now = Date.now()
+    if (now - lastSpawnAt < 5 * 60 * 1000) {
+      log('距上次尝试启动不足 5 分钟，本轮不再尝试')
+      return null
+    }
+    lastSpawnAt = now
 
     let exe = await findLocalExe()
     if (!exe) exe = await fetchExeFromPeer()
@@ -416,12 +491,19 @@ export function apply(ctx, rawConfig) {
     // 关键：不是"来了就唤醒"，而是等到这段安静时间过去、且 AI 空闲时才唤醒。
     // 同一批被拆成几条到达也不会唤醒两次，更不会让 AI 漏看后到的那条。
     b.wakeTimer = setTimeout(async function tick() {
-      if (stopped) return
-      const cur = buffers.get(convKey)
-      if (!cur || cur.items.length === 0) return
-      if (Date.now() - cur.lastAt < cfg.wakeDebounceMs) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
-      if (cfg.requireAgentStatus && isBusy()) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
-      await deliver(convKey)
+      // 整个 tick 包在 try 里：这里是**异步定时器回调**，
+      // 一旦它抛错就会变成"未处理的 Promise 拒绝"，而 Node 默认会**直接结束进程**——
+      // 那会把整个 DSH 带崩（表现为"DSH 突然退出，只剩 LanChat"）。所以绝不能让它逃逸。
+      try {
+        if (stopped) return
+        const cur = buffers.get(convKey)
+        if (!cur || cur.items.length === 0) return
+        if (Date.now() - cur.lastAt < cfg.wakeDebounceMs) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
+        if (cfg.requireAgentStatus && isBusy()) { cur.wakeTimer = setTimeout(tick, cfg.wakeDebounceMs); return }
+        await deliver(convKey)
+      } catch (e) {
+        logErr(`唤醒流程异常（已忽略，不影响 DSH）: ${e?.message ?? e}`)
+      }
     }, cfg.wakeDebounceMs)
   }
 
