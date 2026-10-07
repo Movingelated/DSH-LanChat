@@ -1,4 +1,4 @@
-﻿// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
+// LanChat 局域网通讯桥：给 DSH 的 AI 提供原生工具
 //
 // 解决两个真实痛点：
 //  1) 合并发送：AI 连发「文字 + 文件」时，若文字先单独到达，对面的 AI 会被立刻唤醒并开始处理，
@@ -77,6 +77,9 @@ export const Config = z
       batchWindowMs: z.number().default(30000).volatile(),
       wakeDebounceMs: z.number().default(4000).volatile(),
       requireAgentStatus: z.boolean().default(true).volatile(),
+      // 收到消息时**要唤醒哪些会话**（多选，存 sessionId）。设置页勾选写入；
+      // 为空则回退到旧行为（最近一次调用过 LanChat 工具的会话）。
+      ...(typeof z.array === 'function' ? { wakeSessions: z.array(z.string()).default([]).volatile() } : {}),
     })
   : undefined
 
@@ -262,6 +265,13 @@ export function apply(ctx, rawConfig) {
     autoStart: pick(rawConfig, 'autoStart', D.autoStart) !== false,
     allowFetchFromPeer: pick(rawConfig, 'allowFetchFromPeer', D.allowFetchFromPeer) !== false,
     requireAgentStatus: pick(rawConfig, 'requireAgentStatus', D.requireAgentStatus) !== false,
+    // 唤醒目标会话列表（设置页勾选）。兼容数组与逗号分隔字符串两种存法。
+    wakeSessions: (() => {
+      const v = deref(rawConfig?.wakeSessions)
+      if (Array.isArray(v)) return v.filter((x) => typeof x === 'string' && x.length > 0)
+      if (typeof v === 'string' && v.length > 0) return v.split(',').map((s) => s.trim()).filter(Boolean)
+      return []
+    })(),
   })
   const cfg = read()
   const baseOf = (c) => `http://127.0.0.1:${c.port}`
@@ -495,16 +505,23 @@ export function apply(ctx, rawConfig) {
     if (!refresh().enabled) return
     const b = buffers.get(convKey)
     if (!b || b.items.length === 0) return
-    if (!sessionAgent) {
+    // 唤醒目标：
+    //   ① 设置页勾选的会话（可多选）—— 用户显式指定，优先级最高，
+    //      **不需要**该会话先调用过任何工具（这正是"勾选"要解决的场景）；
+    //   ② 没勾选时回退到"最近调用过 LanChat 工具的会话"（旧行为）。
+    const targets = cfg.wakeSessions.length > 0
+      ? cfg.wakeSessions.slice()
+      : (sessionAgent ? [sessionAgent.id] : [])
+    if (targets.length === 0) {
       // 不能投递就**丢掉**，绝不在缓冲里囤积 —— 囤积等于内存只涨不降（有过 OOM 事故）。
-      // 本会话只要调用过任意 lanchat_* 工具就会绑定 Agent，之后收到的消息才会被唤醒投递。
-      logErr('还没有会话绑定唤醒目标（本会话没调用过 LanChat 工具），本条已丢弃；在你想接收唤醒的会话里调用一次 lanchat_status 即可绑定')
+      logErr('没有唤醒目标：要么在「设置 → 局域网通讯」里勾选要唤醒的会话，'
+        + '要么在目标会话里调用一次任意 lanchat_* 工具。本条已丢弃（不会囤积，避免内存只涨不降）')
       buffers.delete(convKey)
       return
     }
     const sc = ctx.get('sessionController')
     if (!sc?.prompt) {
-      logErr('缺少 sessionController 服务，无法唤醒本会话 AI')
+      logErr('缺少 sessionController 服务，无法唤醒会话 AI')
       return
     }
     const n = b.items.length
@@ -521,14 +538,26 @@ export function apply(ctx, rawConfig) {
       //    signal.throwIfAborted()，只传一个参数会得到
       //    "Cannot read properties of undefined (reading 'throwIfAborted')"
       //    —— 实测这正是"收到消息却唤不醒 AI"的原因。
-      await sc.prompt({
-        requestId: `lanchat-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-        sessionId: sessionAgent.id,
-        mode: 'queue',
-        content: [{ type: 'text', text: body }],
-      }, wakeSignal())
+      let delivered = 0
+      const failed = []
+      for (const sid of targets) {
+        try {
+          await sc.prompt({
+            requestId: `lanchat-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+            sessionId: sid,
+            mode: 'queue',
+            content: [{ type: 'text', text: body }],
+          }, wakeSignal())
+          delivered++
+        } catch (e) {
+          failed.push(`${String(sid).slice(0, 12)}…(${e?.message ?? e})`)
+        }
+      }
+      if (delivered === 0) throw new Error('全部会话投递失败: ' + failed.join('; '))
       buffers.delete(convKey)
-      log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer} → 会话 ${String(sessionAgent.id).slice(0, 12)}…`)
+      log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer} → ${delivered}/${targets.length} 个会话`
+        + (cfg.wakeSessions.length > 0 ? '（设置页勾选）' : '（回退：最近会话）')
+        + (failed.length ? '；失败: ' + failed.join('; ') : ''))
     } catch (e) {
       logErr(`投递失败，消息留在缓冲稍后重试: ${e?.message ?? e}`)
       b.lastAt = Date.now()

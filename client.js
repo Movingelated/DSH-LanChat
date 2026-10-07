@@ -1,4 +1,4 @@
-/**
+﻿/**
  * LanChat 局域网通讯桥 —— 客户端半身（「设置 → 局域网通讯」）
  *
  * 写入通道：宿主行声明了 volatile Config 字段，DSH 的 settings 服务因此把它暴露成
@@ -98,6 +98,7 @@ window.__ModuleLoader__.load({
       { key: 'batchWindowMs', label: '合并窗口（毫秒）', type: 'number', hint: '同一批内容攒够这么久没新增就自动发出，默认 30000' },
       { key: 'wakeDebounceMs', label: '唤醒防抖（毫秒）', type: 'number', hint: '收到消息后安静这么久才唤醒本会话 AI，默认 4000' },
       { key: 'requireAgentStatus', label: 'AI 忙时不打断', type: 'bool', hint: '仅在 DSH 0.2.0+ 生效（0.1.7 无 agent/status 事件时自动降级）' },
+      { key: 'wakeSessions', label: '收到消息时唤醒哪些会话', type: 'sessions', hint: '勾选后 LanChat 收到消息会主动唤醒这些会话的 AI 来处理（可多选）；一个都不勾则回退为「最近调用过 LanChat 工具的会话」。' },
     ]
 
     const DEFAULTS = {
@@ -110,6 +111,7 @@ window.__ModuleLoader__.load({
       batchWindowMs: 30000,
       wakeDebounceMs: 4000,
       requireAgentStatus: true,
+      wakeSessions: [],
     }
 
     function Panel(props) {
@@ -125,6 +127,32 @@ window.__ModuleLoader__.load({
       const savedTimer = React.useRef(null)
       cfgRef.current = cfg
       revRef.current = rev
+
+      // ---- 会话列表（供"唤醒哪些会话"多选）----
+      // 通过客户端 sessions 服务拿：含**会话名称**与**会话 ID**，正是勾选时需要的两样信息。
+      const [sess, setSess] = React.useState(null)          // null = 读取中
+      const [sessErr, setSessErr] = React.useState('')
+      const loadSessions = React.useCallback(async () => {
+        setSessErr('')
+        try {
+          const api = ctx?.sessions
+          if (!api?.search) { setSess([]); setSessErr('本版客户端没有 ctx.sessions.search，无法列出会话'); return }
+          const ctrl = new AbortController()
+          const res = await api.search('', ctrl.signal)
+          const items = (res && res.ok === true ? res.value && res.value.items : res && res.items) || []
+          const list = []
+          for (const it of items) {
+            const id = String(it.sessionId || it.id || (it.session && it.session.id) || '')
+            if (!id) continue
+            list.push({ id, title: String(it.title || it.name || it.label || '(未命名会话)') })
+          }
+          setSess(list)
+        } catch (e) {
+          setSess([])
+          setSessErr('读取会话列表失败：' + String((e && e.message) || e))
+        }
+      }, [ctx])
+      React.useEffect(() => { loadSessions() }, [loadSessions])
 
       const flashSaved = React.useCallback(() => {
         setSaved(true)
@@ -234,6 +262,59 @@ window.__ModuleLoader__.load({
                 onChange: (e) => writeField(f.key, e.target.checked),
                 style: { width: 16, height: 16, cursor: 'pointer' },
               }),
+            ),
+          )
+        } else if (f.type === 'sessions') {
+          const sel = cfg && Array.isArray(cfg[f.key]) ? cfg[f.key] : []
+          rows.push(
+            h('div', { key: f.key, style: { ...S.row, alignItems: 'flex-start' } },
+              h('div', { style: { width: '100%' } },
+                h('div', null, f.label),
+                f.hint ? h('div', { style: S.hint }, f.hint) : null,
+                sessErr ? h('div', { style: { ...S.hint, color: C.err } }, sessErr) : null,
+                sess === null
+                  ? h('div', { style: S.hint }, '正在读取会话列表…')
+                  : sess.length === 0
+                    ? h('div', { style: S.hint }, '没有读到会话（可在别的会话里发一条消息后再刷新）')
+                    : h('div', { style: { marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 } },
+                        ...sess.map((s) => h('label', {
+                          key: s.id,
+                          style: {
+                            display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+                            padding: '6px 8px', borderRadius: 6,
+                            background: sel.indexOf(s.id) >= 0 ? 'rgba(90,160,240,0.10)' : 'transparent',
+                          },
+                        },
+                          h('input', {
+                            type: 'checkbox',
+                            checked: sel.indexOf(s.id) >= 0,
+                            disabled: cfg === null,
+                            onChange: (e) => {
+                              const next = e.target.checked
+                                ? sel.concat([s.id])
+                                : sel.filter((x) => x !== s.id)
+                              writeField(f.key, next)
+                            },
+                            style: { width: 16, height: 16, cursor: 'pointer' },
+                          }),
+                          h('span', null, s.title),
+                          h('span', { style: { ...S.hint, marginLeft: 'auto' } }, s.id),
+                        )),
+                      ),
+                h('div', { style: { marginTop: 8 } },
+                  h('button', {
+                    type: 'button',
+                    onClick: loadSessions,
+                    style: {
+                      padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+                      border: '1px solid rgba(128,128,128,0.4)', background: 'transparent',
+                      color: 'inherit', font: 'inherit',
+                    },
+                  }, '刷新会话列表'),
+                  h('span', { style: { ...S.hint, marginLeft: 8 } },
+                    '已勾选 ' + sel.length + ' 个会话'),
+                ),
+              ),
             ),
           )
         } else {
