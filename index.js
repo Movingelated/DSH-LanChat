@@ -647,6 +647,101 @@ export function apply(ctx, rawConfig) {
   /** 缓冲条数上限（内存安全兜底） */
   const MAX_BUFFER_ITEMS = 50
 
+  /**
+   * 每个会话一个轮询循环（群聊 + 每个私聊各一个），各自持有游标。
+   *
+   * ⚠️ 为什么必须这样：早期实现只有一个循环、请求 `/dsh/recv?since=…`（**不带 peer**），
+   *    而按接口语义"不带 peer = 群聊" ⇒ **私聊消息从来没被监听** ⇒ 私聊永远不会唤醒 AI。
+   *    实测判据（B机 提供）：群聊 3/3 唤醒成功、私聊 0/3 且**没有任何日志** —— 正是"没在监听"的特征。
+   */
+  const pollers = new Map()          // convKey -> { peer, cursor, primed, running }
+  const cursors = new Map()          // convKey -> 游标（供诊断）
+
+  function pollConversation(convKey, peer) {
+    const existing = pollers.get(convKey)
+    if (existing && existing.running) return existing
+    const st = existing || { peer: peer ?? null, cursor: 0, primed: false, running: false }
+    st.peer = peer ?? st.peer
+    st.running = true
+    pollers.set(convKey, st)
+    cursors.set(convKey, st.cursor)
+
+    ;(async () => {
+      const q = (extra) => (st.peer ? `peer=${encodeURIComponent(st.peer)}&${extra}` : extra)
+      try {
+        // 启动时把游标推到"现在"，**跳过启动前的历史**：
+        // 否则每次重启都会拿一整批旧消息去唤醒 AI（实测会把 50 条历史当一批投递）。
+        try {
+          const prime = await http(`/dsh/recv?${q('since=0&timeout=0')}`, { timeoutMs: 8000 })
+          const pj = prime.json
+          if (pj?.ok && typeof pj.next === 'number') {
+            st.cursor = pj.next
+            const mine = (pj.messages ?? []).filter((m) => !m.mine).length
+            if (mine > 0) log(`[${convKey}] 启动前已有 ${mine} 条消息，已跳过（需要时用 lanchat_recv 主动读）`)
+          }
+        } catch { /* 拿不到就从 0 开始 */ }
+        st.primed = true
+
+        while (!stopped && st.running) {
+          if (!refresh().enabled) { await sleep(1500); continue }
+          try {
+            // ⚠️ 必须带游标 since！不带的话服务端按 since=0 处理，每轮都重发全部历史，
+            //    缓冲会无限膨胀 → 实测 7 分钟吃光 4 GB 堆内存（DSH OOM abort，exit 134）。
+            const r = await http(`/dsh/recv?${q(`since=${st.cursor}&timeout=20`)}`, { timeoutMs: 32000 })
+            const j = r.json
+            if (!j?.ok) { await sleep(2000); continue }
+            if (typeof j.next === 'number' && j.next > st.cursor) { st.cursor = j.next; cursors.set(convKey, st.cursor) }
+            const key = j.key ?? convKey
+            for (const m of j.messages ?? []) {
+              if (m.mine) continue                       // 自己发的消息不唤醒自己
+              let b = buffers.get(key)
+              if (!b) { b = { peer: m.from ?? '未知', items: [], lastAt: 0, wakeTimer: null, firstAt: 0 }; buffers.set(key, b) }
+              b.peer = m.from ?? b.peer
+              const files = m.files?.length ? `（含 ${m.files.length} 个文件：${m.files.map((f) => f.name).join(', ')}）` : ''
+              b.items.push(`【来自 ${m.from}${m.batch ? `｜批次 ${m.batch}` : ''}】${m.text ?? ''}${files}`)
+              b.lastAt = Date.now()
+              if (b.items.length > MAX_BUFFER_ITEMS) b.items.splice(0, b.items.length - MAX_BUFFER_ITEMS)
+              scheduleWake(key)
+            }
+          } catch {
+            await sleep(3000)
+          }
+        }
+      } catch (e) {
+        logErr(`会话 ${convKey} 的轮询异常退出（将不再监听它）: ${e?.message ?? e}`)
+      } finally {
+        st.running = false
+        pollers.delete(convKey)
+      }
+    })()
+
+    return st
+  }
+
+  /** 发现与我相关的私聊会话，并各起一个轮询（已在跑的不重复起）。 */
+  async function discoverPrivatePollers() {
+    try {
+      const r = await http('/api/convs', { timeoutMs: 8000 })
+      const list = r.json
+      if (!Array.isArray(list)) return
+      let started = 0
+      for (const c of list) {
+        if (!c || c.scope !== 'private') continue
+        const key = String(c.key ?? '')
+        if (!key) continue
+        // 只关心"包含本机节点号"的私聊（别人之间的私聊与我无关）
+        if (selfNodeId && key.indexOf(selfNodeId) < 0) continue
+        const peer = c.peerId ? String(c.peerId) : ''
+        if (!peer) continue
+        if (pollers.get(key)?.running) continue
+        pollConversation(key, peer)
+        started++
+        log(`已开始监听私聊会话（对端 ${c.peerName || peer}）：${key}`)
+      }
+      if (started > 0) log(`本轮新增 ${started} 个私聊监听，共 ${pollers.size} 个会话在监听`)
+    } catch { /* 发现失败不影响已跑的监听 */ }
+  }
+
   async function pollLoop() {
     let me = await ensureRunning()
     while (!me && !stopped) {
@@ -656,52 +751,20 @@ export function apply(ctx, rawConfig) {
     if (stopped) return
     log(`已连接 LanChat（本机 ${selfNodeId || '未知'}，版本 ${me.version ?? '?'}）`)
 
-    // 启动时先把游标推到"现在"，**跳过启动前的历史**：
-    // 否则每次 DSH 重启都会拿一整批旧消息去唤醒 AI（实测会把 50 条历史当一批投递）。
-    // 历史随时可以用 lanchat_recv 主动读，不该由唤醒机制代劳。
-    try {
-      const prime = await http('/dsh/recv?since=0&timeout=0', { timeoutMs: 8000 })
-      const pj = prime.json
-      if (pj?.ok && typeof pj.next === 'number') {
-        cursor = pj.next
-        const mine = (pj.messages ?? []).filter((m) => !m.mine).length
-        if (mine > 0) log(`启动前已有 ${mine} 条消息，已跳过（需要时用 lanchat_recv 主动读）`)
-      }
-    } catch { /* 拿不到就从 0 开始，不影响主流程 */ }
+    // 群聊：常驻一个监听
+    pollConversation('public', null)
+    // 私聊：先发现一次，之后定期复查（新出现的私聊会被自动纳入监听）
+    await discoverPrivatePollers()
 
     while (!stopped) {
-      // 设置页可以随时改配置：启用开关、端口变化都在这里即时生效
       if (!refresh().enabled) { await sleep(1500); continue }
       if (reconnect) {
         reconnect = false
         const again = await ensureRunning()
         if (again) log('已按新设置重连 LanChat')
       }
-      try {
-        // ⚠️ 必须带游标 since！不带的话服务端按 since=0 处理，
-        //    每 20 秒都会把**全部历史消息**再返回一遍，而下面又会把它们重新塞进缓冲 →
-        //    缓冲无限膨胀 → 实测 7 分钟吃光 4 GB 堆内存，DSH 直接 OOM abort（exit 134）。
-        const r = await http(`/dsh/recv?since=${cursor}&timeout=20`, { timeoutMs: 32000 })
-        const j = r.json
-        if (!j?.ok) { await sleep(2000); continue }
-        // 游标前移：next 是本会话已收到的最大序号，下次只取比它更新的
-        if (typeof j.next === 'number' && j.next > cursor) cursor = j.next
-        const convKey = j.key ?? 'public'
-        for (const m of j.messages ?? []) {
-          if (m.mine) continue                          // 自己发的消息不唤醒自己
-          let b = buffers.get(convKey)
-          if (!b) { b = { peer: m.from ?? '未知', items: [], lastAt: 0, wakeTimer: null, firstAt: 0 }; buffers.set(convKey, b) }
-          b.peer = m.from ?? b.peer
-          const files = m.files?.length ? `（含 ${m.files.length} 个文件：${m.files.map((f) => f.name).join(', ')}）` : ''
-          b.items.push(`【来自 ${m.from}${m.batch ? `｜批次 ${m.batch}` : ''}】${m.text ?? ''}${files}`)
-          b.lastAt = Date.now()
-          // 缓冲上限：无论什么异常情况，都不允许它无限增长（内存安全兜底）
-          if (b.items.length > MAX_BUFFER_ITEMS) b.items.splice(0, b.items.length - MAX_BUFFER_ITEMS)
-          scheduleWake(convKey)
-        }
-      } catch {
-        await sleep(3000)
-      }
+      await sleep(12000)
+      await discoverPrivatePollers()
     }
   }
 
