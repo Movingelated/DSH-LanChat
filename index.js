@@ -195,6 +195,18 @@ const PLUGIN_DIR = (() => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * 本插件的版本号（来自同目录 package.json）。
+ * ⚠️ 为什么要打进日志：**宿主半身只在 DSH 启动时加载一次**，而 bundle 开关只重载客户端半身。
+ *    于是"磁盘上已是新代码、内存里还是旧代码"是常态 —— 实测为此排查了很久。
+ *    启动日志里带上版本号，'加载的是哪一版'就一目了然。
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(fsSync.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8')).version || '?'
+  } catch { return '?' }
+})()
+
 // ---------------------------------------------------------------- 日志（同时写文件，便于事后取证）
 // 为什么落盘：插件日志默认只进 DSH 的终端，一旦 DSH 自己退出，现场就没了。
 // 日志放在 %LOCALAPPDATA%\LanChat\dsh-plugin.log，超过 1 MB 自动截断重开。
