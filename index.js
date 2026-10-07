@@ -465,7 +465,10 @@ export function apply(ctx, rawConfig) {
     const b = buffers.get(convKey)
     if (!b || b.items.length === 0) return
     if (!sessionAgent) {
-      logErr('尚未确定本会话 Agent（本会话还没调用过 LanChat 工具），消息留在缓冲里')
+      // 不能投递就**丢掉**，绝不在缓冲里囤积 —— 囤积等于内存只涨不降（有过 OOM 事故）。
+      // 本会话只要调用过任意 lanchat_* 工具就会绑定 Agent，之后收到的消息才会被唤醒投递。
+      logErr('尚未确定本会话 Agent（本会话还没调用过 LanChat 工具），本条已丢弃；先调用一次 lanchat_status 即可绑定')
+      buffers.delete(convKey)
       return
     }
     const sc = ctx.get('sessionController')
@@ -522,6 +525,11 @@ export function apply(ctx, rawConfig) {
   }
 
   // ---------------------------------------------------------------- 后台收消息
+  /** 群聊收消息游标：只取比它新的，避免每次轮询都重取全部历史（OOM 事故的根因） */
+  let cursor = 0
+  /** 缓冲条数上限（内存安全兜底） */
+  const MAX_BUFFER_ITEMS = 50
+
   async function pollLoop() {
     let me = await ensureRunning()
     while (!me && !stopped) {
@@ -540,9 +548,14 @@ export function apply(ctx, rawConfig) {
         if (again) log('已按新设置重连 LanChat')
       }
       try {
-        const r = await http('/dsh/recv?timeout=20', { timeoutMs: 32000 })
+        // ⚠️ 必须带游标 since！不带的话服务端按 since=0 处理，
+        //    每 20 秒都会把**全部历史消息**再返回一遍，而下面又会把它们重新塞进缓冲 →
+        //    缓冲无限膨胀 → 实测 7 分钟吃光 4 GB 堆内存，DSH 直接 OOM abort（exit 134）。
+        const r = await http(`/dsh/recv?since=${cursor}&timeout=20`, { timeoutMs: 32000 })
         const j = r.json
         if (!j?.ok) { await sleep(2000); continue }
+        // 游标前移：next 是本会话已收到的最大序号，下次只取比它更新的
+        if (typeof j.next === 'number' && j.next > cursor) cursor = j.next
         const convKey = j.key ?? 'public'
         for (const m of j.messages ?? []) {
           if (m.mine) continue                          // 自己发的消息不唤醒自己
@@ -552,6 +565,8 @@ export function apply(ctx, rawConfig) {
           const files = m.files?.length ? `（含 ${m.files.length} 个文件：${m.files.map((f) => f.name).join(', ')}）` : ''
           b.items.push(`【来自 ${m.from}${m.batch ? `｜批次 ${m.batch}` : ''}】${m.text ?? ''}${files}`)
           b.lastAt = Date.now()
+          // 缓冲上限：无论什么异常情况，都不允许它无限增长（内存安全兜底）
+          if (b.items.length > MAX_BUFFER_ITEMS) b.items.splice(0, b.items.length - MAX_BUFFER_ITEMS)
           scheduleWake(convKey)
         }
       } catch {
