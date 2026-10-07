@@ -310,6 +310,8 @@ export function apply(ctx, rawConfig) {
   let stopped = false
   /** 上次尝试拉起 LanChat 的时间（冷却用，避免反复 spawn） */
   let lastSpawnAt = 0
+  /** 上一次"勾选不含最近使用会话"告警的时刻（限流用） */
+  let deliverWarnAt = 0
   /** 上次尝试启动 LanChat 的失败原因（供 lanchat_status 诊断输出） */
   let lastStartError = ''
   /** 端口被设置页改过 → 需要重连一次 */
@@ -591,6 +593,17 @@ export function apply(ctx, rawConfig) {
         }
       }
       if (delivered === 0) throw new Error('全部会话投递失败: ' + failed.join('; '))
+      // 自我诊断：勾选的会话里**不包含**最近在用 LanChat 的那个 ⇒ 极可能是勾错了。
+      // 实测场景：用户勾了 A 会话、却在 B 会话里等唤醒，表现为"别人能被唤醒、我这台不能"。
+      if (cfg.wakeSessions.length > 0 && sessionAgent && cfg.wakeSessions.indexOf(sessionAgent.id) < 0) {
+        if (Date.now() - deliverWarnAt > 60000) {
+          deliverWarnAt = Date.now()
+          logErr('⚠ 唤醒目标里**不含**最近在用 LanChat 的会话：勾选=['
+            + cfg.wakeSessions.map((s) => String(s).slice(0, 12)).join(', ')
+            + '] 最近使用=' + String(sessionAgent.id).slice(0, 12) + '…'
+            + ' —— 若你在后者里等唤醒，请到「设置 → 局域网通讯」把它也勾上')
+        }
+      }
       buffers.delete(convKey)
       log(`已${busy ? '入队（AI 正忙，不打断）' : '唤醒 AI'}：${n} 条来自 ${b.peer} → ${delivered}/${targets.length} 个会话`
         + (cfg.wakeSessions.length > 0 ? '（设置页勾选）' : '（回退：最近会话）')
@@ -810,7 +823,9 @@ const OBJ = (props, required) => ({ type: 'object', properties: props, required,
       me: { type: 'object', additionalProperties: true },
       peers: { type: 'array', items: { type: 'object', additionalProperties: true } },
       files: { type: 'array', items: { type: 'object', additionalProperties: true } },
-      wakeTarget: { type: 'string' },
+      wakeTarget: nullable('string'),
+      wakeTargets: { type: 'array', items: { type: 'string' } },
+      lastToolSession: nullable('string'),
       wakeTargetHint: { type: 'string' },
     }, ['ok'])),
     async execute(args, exec) {
@@ -842,12 +857,16 @@ const OBJ = (props, required) => ({ type: 'object', properties: props, required,
         me: { name: me.name, nodeId: me.nodeId, port: me.port, ips: me.ips },
         peers: peers.map((p) => ({ node: p.node, name: p.name, online: p.online })),
         note: '用 peers[].name 或 node 作为 lanchat_send / lanchat_recv 的 peer 参数；peer 省略 = 群聊',
-        // 唤醒会投给哪个会话？—— 收到消息却"唤不醒 AI"时，第一个要看的字段就是它。
-        // 规则：最近一次调用过任意 lanchat_* 工具的会话就是唤醒目标。
-        wakeTarget: sessionAgent?.id ?? null,
-        wakeTargetHint: sessionAgent
-          ? '收到消息时会唤醒这个会话；想换会话，在目标会话里调用一次任意 lanchat_* 工具即可'
-          : '当前还没绑定唤醒目标：在想接收唤醒的会话里调用一次 lanchat_status 即可',
+        // 唤醒会投给哪些会话：收到消息却"唤不醒 AI"时，第一个要看的字段就是它。
+        // ⚠️ 两个来源必须分清（曾经因为混为一谈而排查很久）：
+        //    wakeTargets     —— 设置页勾选的（**优先**，可多选）
+        //    lastToolSession —— 最近一次调用过 lanchat_* 工具的会话（**勾选为空时**的回退）
+        wakeTargets: cfg.wakeSessions.slice(),
+        lastToolSession: sessionAgent?.id ?? null,
+        wakeTarget: (cfg.wakeSessions.length > 0 ? cfg.wakeSessions : (sessionAgent ? [sessionAgent.id] : []))[0] ?? null,
+        wakeTargetHint: cfg.wakeSessions.length > 0
+          ? `当前按「设置页勾选」投递（${cfg.wakeSessions.length} 个）。若你在某会话里等唤醒却没反应，请到设置页把该会话也勾上（本会话 id 见 lastToolSession）`
+          : '当前没有勾选任何会话，按「最近调用过工具的会话」回退投递；建议到设置页明确勾选',
       }
       if (args.includeFiles) out.files = (await http('/dsh/files', { timeoutMs: 6000 })).json?.files ?? []
       return out

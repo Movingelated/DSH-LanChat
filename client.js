@@ -128,6 +128,17 @@ window.__ModuleLoader__.load({
       cfgRef.current = cfg
       revRef.current = rev
 
+      /** 把 updatedAt 格式化成"今天 19:44"这种好认的形式。 */
+      const fmtTime = (ms) => {
+        try {
+          const d = new Date(Number(ms))
+          const p = (n) => (n < 10 ? '0' + n : String(n))
+          const today = new Date()
+          const sameDay = d.toDateString() === today.toDateString()
+          return (sameDay ? '今天 ' : (p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ')) + p(d.getHours()) + ':' + p(d.getMinutes())
+        } catch (e) { return '' }
+      }
+
       // ---- 会话列表（供"唤醒哪些会话"多选）----
       // 通过客户端 sessions 服务拿：含**会话名称**与**会话 ID**，正是勾选时需要的两样信息。
       const [sess, setSess] = React.useState(null)          // null = 读取中
@@ -348,6 +359,9 @@ window.__ModuleLoader__.load({
                             style: { width: 16, height: 16, cursor: 'pointer' },
                           }),
                           h('span', null, s.title),
+                          s.updatedAt
+                            ? h('span', { style: { ...S.hint, whiteSpace: 'nowrap' } }, fmtTime(s.updatedAt))
+                            : null,
                           h('span', { style: { ...S.hint, marginLeft: 'auto' } }, s.id),
                         )),
                       ),
