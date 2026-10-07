@@ -135,32 +135,67 @@ window.__ModuleLoader__.load({
       const loadSessions = React.useCallback(async () => {
         setSessErr('')
         try {
-          // ⚠️ Cordis 规定：访问 ctx.sessions 必须先在本插件 inject 里声明，
-          //    否则抛 "cannot get property \"sessions\" without inject"（实测踩过）。
-          //    这里再做一层兜底：属性访问失败时退到 ctx.get()，并如实报错而不是白屏。
-          let api = null
-          try {
-            api = ctx?.sessions
-          } catch (e) {
-            api = null
+          // 取会话列表：**正确的接口**是 ctx.remote.session.list()
+          //   —— 宿主 sessionController 通过 @Remote('list') 暴露成 remote.session 命名空间。
+          //   （ctx.sessions.search('') 那条路走不通：空查询返回空，且它是另一个服务。）
+          //   会话摘要里**没有 title 字段**，标题在 projections.values 里，故按三级回退显示：
+          //   标题 → 工作区目录 → 短会话 ID。
+          const pickTitle = (it) => {
+            const vals = it && it.projections && it.projections.values
+            if (vals && typeof vals === 'object') {
+              for (const k of Object.keys(vals)) {
+                if (!/title/i.test(k)) continue
+                const raw = vals[k]
+                const s = typeof raw === 'string'
+                  ? raw
+                  : (raw && (raw.title || raw.value || raw.text))
+                if (typeof s === 'string' && s.trim()) return s.trim()
+              }
+            }
+            if (it && it.cwd) {
+              const base = String(it.cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+              if (base) return base + '（工作区）'
+            }
+            return '会话 ' + String((it && it.sessionId) || '').slice(0, 8)
           }
-          if (!api && typeof ctx?.get === 'function') {
-            try { api = ctx.get('sessions') } catch (e) { api = null }
-          }
-          if (!api?.search) {
-            setSess([])
-            setSessErr('拿不到 sessions 服务（需要 inject 声明 sessions）—— 可先用手动方式：在目标会话里调用一次 lanchat_status')
-            return
-          }
+          let items = []
+          let via = ''
           const ctrl = new AbortController()
-          const res = await api.search('', ctrl.signal)
-          const items = (res && res.ok === true ? res.value && res.value.items : res && res.items) || []
+          const rs = ctx && ctx.remote && ctx.remote.session
+          if (rs && typeof rs.list === 'function') {
+            const res = await rs.list({}, ctrl.signal)
+            const val = res && res.ok === true ? res.value : res
+            items = (val && val.items) || []
+            via = 'remote.session.list'
+          } else {
+            // 退路：客户端 sessions 服务（有的版本可用）
+            let api = null
+            try { api = ctx && ctx.sessions } catch (e) { api = null }
+            if (!api && ctx && typeof ctx.get === 'function') { try { api = ctx.get('sessions') } catch (e) { api = null } }
+            if (api && typeof api.search === 'function') {
+              const res = await api.search('', ctrl.signal)
+              const val = res && res.ok === true ? res.value : res
+              items = (val && val.items) || []
+              via = 'sessions.search'
+            }
+          }
           const list = []
           for (const it of items) {
-            const id = String(it.sessionId || it.id || (it.session && it.session.id) || '')
+            if (!it) continue
+            if (it.origin === 'subagent') continue          // 子代理会话不作为唤醒目标
+            const id = String(it.sessionId || it.id || '')
             if (!id) continue
-            list.push({ id, title: String(it.title || it.name || it.label || '(未命名会话)') })
+            list.push({
+              id,
+              title: pickTitle(it),
+              running: it.running === true,
+              updatedAt: Number(it.updatedAt) || 0,
+            })
           }
+          list.sort((a, b) => b.updatedAt - a.updatedAt)
+          setSess(list)
+          if (list.length > 0) setSessErr('')
+          else setSessErr('接口返回 0 个会话' + (via ? '（来自 ' + via + '）' : '（没有可用接口）'))
           setSess(list)
         } catch (e) {
           setSess([])
@@ -414,7 +449,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'remote', 'remote.settings', 'sessions'],
+      inject: ['slots', 'remote', 'remote.settings', 'sessions', 'remote.session'],
       apply(ctx) {
         // ⚠️ 必须像参考插件那样：先 slots.inject(槽位名, 回调) 声明占用，再在回调里 register。
         //    直接 register（不 inject）会注册不上 —— 而且如果外面套了 try/catch 就会**静默失败**，
